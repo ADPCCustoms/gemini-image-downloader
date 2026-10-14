@@ -19,7 +19,8 @@ Download all the images in your Gemini <b>Library</b> to your PC in one go, with
 - Runs **100% locally**: you sign in to your own Google account in a normal browser window, and nothing is uploaded anywhere
 - Uses your installed **Google Chrome or Microsoft Edge**, no extra browser download
 - **Safe to re-run**: skips images it has already saved, so you only get new ones
-- Simple progress messages, and friendly errors if something goes wrong
+- A simple window with a progress bar, a Stop button and a choice of save folder
+- Friendly messages if something goes wrong
 - Windows `.exe` available, no Python needed
 
 ## Download and use (Windows)
@@ -29,11 +30,13 @@ Download all the images in your Gemini <b>Library</b> to your PC in one go, with
 3. If Windows shows **"Windows protected your PC"**, click **More info → Run anyway**.
    The exe isn't code-signed, so Windows warns about it. You can check the file against the
    `.sha256` file on the release page, or [build it yourself](#build-from-source).
-4. A browser window opens on Gemini. Sign in if asked and wait until your chats are visible,
-   then return to the black console window and press **Enter**.
-5. Wait while it scrolls through your Library and saves the images (large libraries can take
-   several minutes). Don't close the browser window.
-6. When it finishes, the `gemini_images` folder next to the program opens with your images.
+4. In the window, choose where to save your images (or keep the default `gemini_images` folder
+   next to the program) and click **Start**.
+5. A browser window opens on Gemini. Sign in if asked and wait until your chats are visible,
+   then click **Continue** in the yellow box in the tool's window.
+6. Wait while it scrolls through your Library and saves the images (large libraries can take
+   several minutes). Don't close the browser window. You can click **Stop** at any time.
+7. When it finishes, the folder with your images opens.
 
 Run it again any time to pick up new images. To sign out, delete the `browser_profile` folder
 next to the program.
@@ -43,9 +46,10 @@ next to the program.
 ## Privacy
 
 - It talks only to Gemini and Google's image servers, using your own login.
-- It writes only to its own folder: `gemini_images/` (your images), `browser_profile/`
-  (its saved login, separate from your everyday browser profile), and, only if something goes
-  wrong, `error_log.txt` / `no_images_found.png`.
+- It writes only to the folder you choose for your images (`gemini_images/` next to the program by
+  default) and to its own `browser_profile/` folder next to the program (its saved login, separate
+  from your everyday browser profile). Only if something goes wrong it also writes `error_log.txt`
+  or `no_images_found.png` there.
 - It doesn't read or change anything else on your computer, and it never touches your normal
   Chrome or Edge profile, passwords, history or bookmarks.
 - **Never share your `browser_profile` folder.** It contains your Google login session.
@@ -59,7 +63,7 @@ next to the program.
 | "No images were found" | Your Library may be empty, or Gemini changed its layout. A screenshot (`no_images_found.png`) is saved next to the program; please [open an issue](../../issues) with it (blank out anything personal). |
 | Antivirus blocks or removes the exe | A known false positive with PyInstaller programs. Add an exception, or [build it yourself](#build-from-source). |
 | Some images failed | Run it again; it retries only the missing ones. |
-| Anything else | Run `GeminiImageDownloader.exe --debug` from a terminal and check `error_log.txt`. |
+| Anything else | Check `error_log.txt` next to the program and [open an issue](../../issues) with its contents. |
 
 Another option from Google: [Google Takeout](https://takeout.google.com) can export some
 Gemini data without any tools. What it includes has varied over time.
@@ -73,7 +77,8 @@ python -m pip install -r requirements.txt
 python gemini_image_downloader.py
 ```
 
-Add `--debug` for detailed diagnostic output.
+This opens the window. Add `--cli` to run in the console instead, and `--debug` for
+extra diagnostic output (when running from source).
 
 ## Build from source
 
@@ -86,7 +91,7 @@ build.bat
 The program is created at `dist\GeminiImageDownloader.exe`. To use a different icon, replace
 `icon.ico` before building.
 
-Releases are built automatically by GitHub Actions: pushing a tag such as `v1.0.0` builds the
+The exe is built as a windowed app (no console). Releases are built automatically by GitHub Actions: pushing a tag such as `v1.0.0` builds the
 exe and attaches it, with a SHA-256 checksum, to a GitHub release.
 
 ## How it works

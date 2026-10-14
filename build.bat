@@ -18,11 +18,11 @@ if exist GeminiImageDownloader.spec del /q GeminiImageDownloader.spec
 if exist "%~dp0icon.ico" (
     echo.
     echo *** Using icon: %~dp0icon.ico ***
-    python -m PyInstaller --clean --onefile --collect-all playwright --icon "%~dp0icon.ico" --name GeminiImageDownloader gemini_image_downloader.py
+    python -m PyInstaller --clean --onefile --collect-all playwright --windowed --add-data "icon.ico;." --icon "%~dp0icon.ico" --name GeminiImageDownloader gemini_image_downloader.py
 ) else (
     echo.
     echo *** icon.ico NOT FOUND in %~dp0 - building with the default icon ***
-    python -m PyInstaller --clean --onefile --collect-all playwright --name GeminiImageDownloader gemini_image_downloader.py
+    python -m PyInstaller --clean --onefile --windowed --collect-all playwright --name GeminiImageDownloader gemini_image_downloader.py
 )
 
 echo.
