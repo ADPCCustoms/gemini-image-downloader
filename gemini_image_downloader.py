@@ -14,7 +14,7 @@ import asyncio, base64, hashlib, os, re, sys, traceback
 from pathlib import Path
 from playwright.async_api import async_playwright
 
-VERSION = "1.0"
+VERSION = "1.0.1"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -31,6 +31,33 @@ BROWSERS = [("chrome", "Google Chrome"), ("msedge", "Microsoft Edge")]
 
 COLLECT_JS = """() => [...document.querySelectorAll('img')]
     .map(e => ({src: e.currentSrc || e.src, w: e.naturalWidth, h: e.naturalHeight}))"""
+
+
+GEMINI_URL = "https://gemini.google.com/app"
+
+
+async def safe_goto(page, url, tries=3):
+    """Go to a page, retrying if a redirect interrupts the navigation
+    (Google redirects while you're signing in, which can cancel a goto)."""
+    for attempt in range(tries):
+        try:
+            await page.goto(url, wait_until="domcontentloaded")
+            return
+        except Exception as e:
+            if attempt == tries - 1:
+                raise
+            if DEBUG:
+                print(f"(navigation interrupted, retrying: {e})")
+            await page.wait_for_timeout(3000)
+
+
+def looks_signed_out(url):
+    """True if we're on a Google sign-in page or Gemini's signed-out landing page."""
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    if "accounts.google.com" in u.netloc:
+        return True
+    return u.netloc == "gemini.google.com" and u.path in ("", "/", "/welcome")
 
 
 def banner():
@@ -146,19 +173,29 @@ async def run():
             return
 
         page = await ctx.new_page()
-        await page.goto("https://gemini.google.com/app")
+        await safe_goto(page, GEMINI_URL)
         print("A browser window has opened on Gemini.")
         print("If you're asked to sign in, sign in to the Google account whose images you want.")
         input("When Gemini has fully loaded and you can see your chats, press Enter here... ")
 
-        await page.goto("https://gemini.google.com/app")
-        await page.wait_for_load_state("domcontentloaded")
-        await page.wait_for_timeout(5000)
-
-        if "accounts.google.com" in page.url:
-            print("\nIt looks like you're not signed in yet. Sign in in the browser window.")
-            input("Once Gemini has loaded, press Enter here... ")
-            await page.wait_for_timeout(3000)
+        # Reload Gemini so the page has settled, and make sure you're really signed in.
+        signed_in = False
+        for attempt in range(4):
+            await safe_goto(page, GEMINI_URL)
+            await page.wait_for_timeout(5000)
+            if not looks_signed_out(page.url):
+                signed_in = True
+                break
+            if attempt == 3:
+                break
+            print("\nIt looks like you're not signed in to Gemini yet.")
+            print("Sign in in the browser window and wait until you can see your chats.")
+            input("Then press Enter here... ")
+        if not signed_in:
+            print("\nCouldn't confirm that you're signed in to Gemini.")
+            print("Please run the tool again and sign in when the browser opens.")
+            await ctx.close()
+            return
 
         print(f"\nOpening '{SECTION}'...")
         if not await click_section(page, SECTION):
