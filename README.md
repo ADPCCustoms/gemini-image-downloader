@@ -19,7 +19,7 @@ Download all the images in your Gemini <b>Library</b> to your PC in one go, with
 - Runs **100% locally**: you sign in to your own Google account in a normal browser window, and nothing is uploaded anywhere
 - Uses your installed **Google Chrome or Microsoft Edge**, no extra browser download
 - **Safe to re-run**: skips images it has already saved, so you only get new ones
-- A simple window with a progress bar, a Stop button and a choice of save folder
+- A clean, modern window with **light and dark modes** (follows Windows by default, or pick Light/Dark), a progress bar, a Stop button and a choice of save folder
 - Friendly messages if something goes wrong
 - Windows `.exe` available, no Python needed
 
@@ -38,6 +38,8 @@ Download all the images in your Gemini <b>Library</b> to your PC in one go, with
    several minutes). Don't close the browser window. You can click **Stop** at any time.
 7. When it finishes, the folder with your images opens.
 
+Use the **Auto / Light / Dark** switch at the top right to change the look; it remembers your choice.
+
 Run it again any time to pick up new images. To sign out, delete the `browser_profile` folder
 next to the program.
 
@@ -48,7 +50,7 @@ next to the program.
 - It talks only to Gemini and Google's image servers, using your own login.
 - It writes only to the folder you choose for your images (`gemini_images/` next to the program by
   default) and to its own `browser_profile/` folder next to the program (its saved login, separate
-  from your everyday browser profile). Only if something goes wrong it also writes `error_log.txt`
+  from your everyday browser profile), plus a tiny `settings.json` that remembers your theme and folder choice. Only if something goes wrong it also writes `error_log.txt`
   or `no_images_found.png` there.
 - It doesn't read or change anything else on your computer, and it never touches your normal
   Chrome or Edge profile, passwords, history or bookmarks.

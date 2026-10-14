@@ -12,5 +12,6 @@ dist/
 # Created when the tool runs - never commit these (they contain your login and images)
 gemini_images/
 browser_profile/
+settings.json
 error_log.txt
 no_images_found.png

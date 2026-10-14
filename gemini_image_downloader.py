@@ -12,7 +12,7 @@ Gemini's web page layout, so it may stop working if Google changes the site.
 Options:  --cli    run in the console instead of the window
           --debug  extra diagnostic output
 """
-import asyncio, base64, hashlib, os, queue, re, sys, threading, traceback
+import asyncio, base64, hashlib, json, os, queue, re, sys, threading, traceback
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -23,7 +23,7 @@ for _name in ("stdin", "stdout", "stderr"):
 
 from playwright.async_api import async_playwright
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -355,20 +355,49 @@ def main_cli():
 
 
 # ======================================================================
-# Window version (default)
+# Window version (default) - built with CustomTkinter
 # ======================================================================
 
-class App:
-    def __init__(self):
-        import tkinter as tk
-        from tkinter import ttk, scrolledtext
-        self.tk, self.ttk = tk, ttk
+SETTINGS_FILE = BASE / "settings.json"
+APPEARANCE = {"Auto": "System", "Light": "Light", "Dark": "Dark"}
 
-        try:    # crisp text on high-DPI Windows screens
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            pass
+# Colours are (light mode, dark mode) pairs
+ACCENT = ("#4F46E5", "#6366F1")
+ACCENT_HOVER = ("#4338CA", "#4F46E5")
+DANGER = ("#DC2626", "#EF4444")
+DANGER_HOVER = ("#B91C1C", "#DC2626")
+TEXT = ("#111827", "#F3F4F6")
+MUTED = ("#6B7280", "#9CA3AF")
+BORDER = ("#D1D5DB", "#374151")
+SUBTLE_HOVER = ("#F3F4F6", "#1F2937")
+NOTICE_BG = ("#FEF3C7", "#3B2F0B")
+NOTICE_BORDER = ("#F59E0B", "#B45309")
+NOTICE_TEXT = ("#1F2937", "#FDE68A")
+
+
+def load_settings():
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    try:
+        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+class App:
+    def __init__(self, ctk):
+        self.ctk = ctk
+        self.settings = load_settings()
+        mode_label = self.settings.get("appearance", "Auto")
+        if mode_label not in APPEARANCE:
+            mode_label = "Auto"
+        ctk.set_appearance_mode(APPEARANCE[mode_label])
+        ctk.set_default_color_theme("blue")
 
         self.q = queue.Queue()
         self.cancelled = False
@@ -376,58 +405,136 @@ class App:
         self.thread = None
         self.bar_indeterminate = False
 
-        root = self.root = tk.Tk()
+        root = self.root = ctk.CTk()
         root.title(f"Gemini Image Downloader v{VERSION}")
-        root.geometry("700x600")
-        root.minsize(600, 520)
-        try:
-            root.iconbitmap(str(resource_path("icon.ico")))
-        except Exception:
-            pass
+        root.geometry("780x680")
+        root.minsize(640, 600)
+        # CustomTkinter applies its own icon shortly after start-up, so set ours after that
+        root.after(250, self.set_icon)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.grid_columnconfigure(0, weight=1)
+        root.grid_rowconfigure(4, weight=1)
 
-        pad = {"padx": 14}
-        ttk.Label(root, text="Gemini Image Downloader",
-                  font=("Segoe UI", 15, "bold")).pack(anchor="w", pady=(12, 2), **pad)
-        ttk.Label(root, wraplength=660, justify="left", text=(
-            "Saves the images from your Gemini Library to a folder on this computer. "
-            "You sign in yourself in a browser window that opens; everything stays on your "
-            "computer and nothing is uploaded anywhere. Unofficial tool, not affiliated with Google."
-        )).pack(anchor="w", pady=(0, 10), **pad)
+        font = lambda size, weight="normal": ctk.CTkFont(family="Segoe UI", size=size, weight=weight)
 
-        folder = ttk.Frame(root)
-        folder.pack(fill="x", pady=(0, 8), **pad)
-        ttk.Label(folder, text="Save images to:").pack(side="left")
-        self.folder_var = tk.StringVar(value=str(DEFAULT_OUT))
-        ttk.Entry(folder, textvariable=self.folder_var).pack(side="left", fill="x", expand=True, padx=8)
-        ttk.Button(folder, text="Browse...", command=self.browse).pack(side="left")
+        # ---- header ----
+        header = ctk.CTkFrame(root, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=26, pady=(22, 6))
+        header.grid_columnconfigure(0, weight=1)
+        titles = ctk.CTkFrame(header, fg_color="transparent")
+        titles.grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(titles, text="Gemini Image Downloader", font=font(24, "bold"),
+                     text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(titles, text="Save your Gemini Library images to this computer",
+                     font=font(13), text_color=MUTED).pack(anchor="w", pady=(2, 0))
+        self.theme_btn = ctk.CTkSegmentedButton(
+            header, values=list(APPEARANCE), command=self.on_theme, height=30,
+            selected_color=ACCENT, selected_hover_color=ACCENT_HOVER)
+        self.theme_btn.set(mode_label)
+        self.theme_btn.grid(row=0, column=1, sticky="e")
 
-        buttons = ttk.Frame(root)
-        buttons.pack(fill="x", pady=(0, 8), **pad)
-        self.start_btn = ttk.Button(buttons, text="Start", command=self.start)
+        # ---- settings card ----
+        card = ctk.CTkFrame(root, corner_radius=14)
+        card.grid(row=1, column=0, sticky="ew", padx=26, pady=(14, 8))
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text="Save images to", font=font(12, "bold"),
+                     text_color=MUTED).grid(row=0, column=0, sticky="w", padx=18, pady=(14, 4), columnspan=2)
+        self.folder_var = ctk.StringVar(value=self.settings.get("folder") or str(DEFAULT_OUT))
+        ctk.CTkEntry(card, textvariable=self.folder_var, height=36, corner_radius=8,
+                     font=font(13)).grid(row=1, column=0, sticky="ew", padx=(18, 8), pady=(0, 12))
+        ctk.CTkButton(card, text="Browse", width=96, height=36, corner_radius=8, command=self.browse,
+                      fg_color="transparent", border_width=1, border_color=BORDER, text_color=TEXT,
+                      hover_color=SUBTLE_HOVER, font=font(13)).grid(row=1, column=1, padx=(0, 18), pady=(0, 12))
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.grid(row=2, column=0, columnspan=2, sticky="w", padx=18, pady=(2, 16))
+        self.start_btn = ctk.CTkButton(row, text="Start download", width=150, height=40, corner_radius=10,
+                                       command=self.start, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                       font=font(14, "bold"))
         self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=8)
-        ttk.Button(buttons, text="Open folder", command=self.open_folder).pack(side="left")
+        self.stop_btn = ctk.CTkButton(row, text="Stop", width=84, height=40, corner_radius=10,
+                                      command=self.stop, fg_color=DANGER, hover_color=DANGER_HOVER,
+                                      font=font(14, "bold"), state="disabled")
+        self.stop_btn.pack(side="left", padx=10)
+        ctk.CTkButton(row, text="Open folder", width=110, height=40, corner_radius=10,
+                      command=self.open_folder, fg_color="transparent", border_width=1,
+                      border_color=BORDER, text_color=TEXT, hover_color=SUBTLE_HOVER,
+                      font=font(13)).pack(side="left")
 
-        # Prompt box: shown when the tool needs you to do something in the browser
-        self.prompt_frame = tk.Frame(root, bg="#FFF4CE", highlightbackground="#E0B84C", highlightthickness=1)
-        self.prompt_label = tk.Label(self.prompt_frame, bg="#FFF4CE", fg="#222222", wraplength=520,
-                                     justify="left", font=("Segoe UI", 10))
-        self.prompt_label.pack(side="left", padx=10, pady=10, fill="x", expand=True)
-        self.continue_btn = ttk.Button(self.prompt_frame, text="Continue", command=self.on_continue)
-        self.continue_btn.pack(side="right", padx=10)
+        # ---- notice box (shown only when you need to do something in the browser) ----
+        self.prompt_frame = ctk.CTkFrame(root, corner_radius=12, fg_color=NOTICE_BG,
+                                         border_width=1, border_color=NOTICE_BORDER)
+        self.prompt_frame.grid(row=2, column=0, sticky="ew", padx=26, pady=(4, 8))
+        self.prompt_frame.grid_columnconfigure(0, weight=1)
+        self.prompt_label = ctk.CTkLabel(self.prompt_frame, text="", text_color=NOTICE_TEXT, font=font(13),
+                                         wraplength=560, justify="left", anchor="w")
+        self.prompt_label.grid(row=0, column=0, sticky="ew", padx=16, pady=14)
+        ctk.CTkButton(self.prompt_frame, text="Continue", width=110, height=36, corner_radius=8,
+                      command=self.on_continue, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      font=font(13, "bold")).grid(row=0, column=1, padx=(0, 16), pady=14)
+        self.prompt_frame.grid_remove()
 
-        self.status_var = tk.StringVar(value="Ready. Click Start.")
-        ttk.Label(root, textvariable=self.status_var).pack(anchor="w", pady=(8, 2), **pad)
-        self.bar = ttk.Progressbar(root, mode="determinate", maximum=100)
-        self.bar.pack(fill="x", pady=(0, 8), **pad)
+        # ---- status and progress ----
+        status = ctk.CTkFrame(root, fg_color="transparent")
+        status.grid(row=3, column=0, sticky="ew", padx=26, pady=(4, 6))
+        status.grid_columnconfigure(0, weight=1)
+        self.status_var = ctk.StringVar(value="Ready. Click Start download.")
+        ctk.CTkLabel(status, textvariable=self.status_var, font=font(13), text_color=TEXT,
+                     anchor="w").grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.bar = ctk.CTkProgressBar(status, height=10, corner_radius=5, progress_color=ACCENT)
+        self.bar.set(0)
+        self.bar.grid(row=1, column=0, sticky="ew")
 
-        self.log_box = scrolledtext.ScrolledText(root, height=12, state="disabled", wrap="word",
-                                                 font=("Consolas", 9))
-        self.log_box.pack(fill="both", expand=True, pady=(0, 12), **pad)
+        # ---- log ----
+        self.log_box = ctk.CTkTextbox(root, corner_radius=12, font=("Consolas", 12), wrap="word")
+        self.log_box.grid(row=4, column=0, sticky="nsew", padx=26, pady=(8, 8))
+        self.log_box.configure(state="disabled")
+
+        ctk.CTkLabel(root, font=font(11), text_color=MUTED,
+                     text="Unofficial tool, not affiliated with Google. Everything stays on your computer."
+                     ).grid(row=5, column=0, pady=(0, 14))
 
         root.after(100, self.poll)
+
+    # ----- helpers -----
+    def set_icon(self):
+        try:
+            self.root.iconbitmap(str(resource_path("icon.ico")))
+        except Exception:
+            pass
+
+    def dialog(self, title, text, buttons=("OK",), wait=False):
+        """A small themed pop-up. Returns the index of the button clicked (if wait=True)."""
+        ctk = self.ctk
+        win = ctk.CTkToplevel(self.root)
+        win.title(title)
+        win.resizable(False, False)
+        result = {"value": None}
+
+        def choose(i):
+            result["value"] = i
+            win.destroy()
+
+        ctk.CTkLabel(win, text=text, wraplength=420, justify="left",
+                     font=ctk.CTkFont(family="Segoe UI", size=13)).pack(padx=26, pady=(24, 16))
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(pady=(0, 20))
+        for i, label in enumerate(buttons):
+            ctk.CTkButton(btns, text=label, width=110, height=34, corner_radius=8,
+                          fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                          command=lambda i=i: choose(i)).pack(side="left", padx=6)
+        try:
+            win.update_idletasks()
+            x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
+            y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
+            win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+            win.after(50, win.lift)
+            win.after(100, win.grab_set)
+        except Exception:
+            pass
+        if wait:
+            self.root.wait_window(win)
+        return result["value"]
 
     # ----- calls made by the worker thread (thread-safe via the queue) -----
     def banner(self): pass
@@ -450,6 +557,11 @@ class App:
         self.check()
 
     # ----- button handlers (main thread) -----
+    def on_theme(self, label):
+        self.ctk.set_appearance_mode(APPEARANCE.get(label, "System"))
+        self.settings["appearance"] = label
+        save_settings(self.settings)
+
     def browse(self):
         from tkinter import filedialog
         d = filedialog.askdirectory(title="Choose where to save your images", mustexist=False)
@@ -464,7 +576,6 @@ class App:
             pass
 
     def start(self):
-        from tkinter import messagebox
         out = Path(self.folder_var.get().strip() or str(DEFAULT_OUT))
         try:
             out.mkdir(parents=True, exist_ok=True)
@@ -472,31 +583,34 @@ class App:
             probe.write_text("x")
             probe.unlink()
         except OSError as e:
-            messagebox.showerror("Can't use that folder", f"Couldn't write to:\n{out}\n\n{e}")
+            self.dialog("Can't use that folder", f"Couldn't write to:\n{out}\n\n{e}")
             return
+        self.settings["folder"] = str(out)
+        save_settings(self.settings)
         self.cancelled = False
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
         self.status_var.set("Starting...")
         self.thread = threading.Thread(target=self.work, args=(out,), daemon=True)
         self.thread.start()
 
     def stop(self):
         self.cancelled = True
-        self.stop_btn.config(state="disabled")
+        self.stop_btn.configure(state="disabled")
         self.status_var.set("Stopping...")
         if self.ask_event:
             self.ask_event.set()
 
     def on_continue(self):
-        self.prompt_frame.pack_forget()
+        self.prompt_frame.grid_remove()
         if self.ask_event:
             self.ask_event.set()
 
     def on_close(self):
-        from tkinter import messagebox
         if self.thread and self.thread.is_alive():
-            if not messagebox.askyesno("Quit", "A download is still running. Stop it and quit?"):
+            choice = self.dialog("Quit?", "A download is still running. Stop it and quit?",
+                                 buttons=("Keep running", "Stop and quit"), wait=True)
+            if choice != 1:
                 return
             self.stop()
             self.close_when_done(50)
@@ -523,32 +637,31 @@ class App:
             self.q.put(("finished",))
 
     # ----- main-thread queue pump -----
+    def append_log(self, text):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", text + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
     def poll(self):
-        from tkinter import messagebox
         try:
             while True:
                 item = self.q.get_nowait()
                 kind = item[0]
                 if kind == "log":
-                    self.log_box.config(state="normal")
-                    self.log_box.insert("end", item[1] + "\n")
-                    self.log_box.see("end")
-                    self.log_box.config(state="disabled")
+                    self.append_log(item[1])
                 elif kind == "status":
                     self.status_var.set(item[1])
                 elif kind == "progress":
                     self.set_progress(item[1], item[2])
                 elif kind == "ask":
                     self.status_var.set("Waiting for you... see the yellow box.")
-                    self.prompt_label.config(text=item[1])
-                    self.prompt_frame.pack(fill="x", padx=14, pady=(0, 8), after=self.stop_btn.master)
+                    self.prompt_label.configure(text=item[1])
+                    self.prompt_frame.grid()
                     self.root.bell()
                 elif kind == "alert":
-                    self.log_box.config(state="normal")
-                    self.log_box.insert("end", item[1] + "\n")
-                    self.log_box.see("end")
-                    self.log_box.config(state="disabled")
-                    messagebox.showwarning("Gemini Image Downloader", item[1])
+                    self.append_log(item[1])
+                    self.dialog("Gemini Image Downloader", item[1])
                 elif kind == "finished":
                     self.finished()
         except queue.Empty:
@@ -558,31 +671,39 @@ class App:
     def set_progress(self, done, total):
         if total is None:
             if not self.bar_indeterminate:
-                self.bar.config(mode="indeterminate")
-                self.bar.start(12)
+                self.bar.configure(mode="indeterminate")
+                self.bar.start()
                 self.bar_indeterminate = True
         else:
             if self.bar_indeterminate:
                 self.bar.stop()
-                self.bar.config(mode="determinate")
+                self.bar.configure(mode="determinate")
                 self.bar_indeterminate = False
-            self.bar.config(maximum=max(total, 1), value=done)
+            self.bar.set(done / max(total, 1))
 
     def finished(self):
         if self.bar_indeterminate:
             self.bar.stop()
-            self.bar.config(mode="determinate", value=0)
+            self.bar.configure(mode="determinate")
+            self.bar.set(0)
             self.bar_indeterminate = False
-        self.prompt_frame.pack_forget()
-        self.start_btn.config(state="normal")
-        self.stop_btn.config(state="disabled")
+        self.prompt_frame.grid_remove()
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
 
     def mainloop(self):
         self.root.mainloop()
 
 
 def main_gui():
-    App().mainloop()
+    try:
+        import customtkinter as ctk
+    except ImportError:
+        print("The window version needs the 'customtkinter' package:\n"
+              "  python -m pip install -r requirements.txt\n"
+              "Starting the console version instead.\n")
+        return main_cli()
+    App(ctk).mainloop()
 
 
 if __name__ == "__main__":
