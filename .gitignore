@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# Created when the tool runs - never commit these (they contain your login and images)
+gemini_images/
+browser_profile/
+error_log.txt
+no_images_found.png

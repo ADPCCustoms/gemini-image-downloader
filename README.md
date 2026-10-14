@@ -1,0 +1,107 @@
+<p align="center">
+  <img src="assets/icon.png" width="110" alt="Gemini Image Downloader icon">
+</p>
+
+<h1 align="center">Gemini Image Downloader</h1>
+
+<p align="center">
+Download all the images in your Gemini <b>Library</b> to your PC in one go, with no need to open every chat.
+</p>
+
+> **Unofficial tool, not affiliated with or endorsed by Google.** It works by reading the Gemini
+> web page, so it may stop working if Google changes the site. Use it only on your own account
+> and at your own risk. Automating a website may be against its terms of service; check them
+> if that matters to you.
+
+## Features
+
+- Saves your Gemini Library images in full size into a single folder
+- Runs **100% locally**: you sign in to your own Google account in a normal browser window, and nothing is uploaded anywhere
+- Uses your installed **Google Chrome or Microsoft Edge**, no extra browser download
+- **Safe to re-run**: skips images it has already saved, so you only get new ones
+- Simple progress messages, and friendly errors if something goes wrong
+- Windows `.exe` available, no Python needed
+
+## Download and use (Windows)
+
+1. Download `GeminiImageDownloader.exe` from the [**Releases**](../../releases) page.
+2. Put it in its own folder (for example `C:\GeminiDownloader`) and double-click it.
+3. If Windows shows **"Windows protected your PC"**, click **More info → Run anyway**.
+   The exe isn't code-signed, so Windows warns about it. You can check the file against the
+   `.sha256` file on the release page, or [build it yourself](#build-from-source).
+4. A browser window opens on Gemini. Sign in if asked and wait until your chats are visible,
+   then return to the black console window and press **Enter**.
+5. Wait while it scrolls through your Library and saves the images (large libraries can take
+   several minutes). Don't close the browser window.
+6. When it finishes, the `gemini_images` folder next to the program opens with your images.
+
+Run it again any time to pick up new images. To sign out, delete the `browser_profile` folder
+next to the program.
+
+**Requirements:** Windows 10/11 and Google Chrome or Microsoft Edge (Edge comes with Windows).
+
+## Privacy
+
+- It talks only to Gemini and Google's image servers, using your own login.
+- It writes only to its own folder: `gemini_images/` (your images), `browser_profile/`
+  (its saved login, separate from your everyday browser profile), and, only if something goes
+  wrong, `error_log.txt` / `no_images_found.png`.
+- It doesn't read or change anything else on your computer, and it never touches your normal
+  Chrome or Edge profile, passwords, history or bookmarks.
+- **Never share your `browser_profile` folder.** It contains your Google login session.
+
+## Troubleshooting
+
+| Problem | What to do |
+|---|---|
+| "Couldn't find Google Chrome or Microsoft Edge" | Install [Google Chrome](https://www.google.com/chrome) and run again. |
+| It can't find "Library" | Click **Library** yourself in the browser window, then press Enter in the console. |
+| "No images were found" | Your Library may be empty, or Gemini changed its layout. A screenshot (`no_images_found.png`) is saved next to the program; please [open an issue](../../issues) with it (blank out anything personal). |
+| Antivirus blocks or removes the exe | A known false positive with PyInstaller programs. Add an exception, or [build it yourself](#build-from-source). |
+| Some images failed | Run it again; it retries only the missing ones. |
+| Anything else | Run `GeminiImageDownloader.exe --debug` from a terminal and check `error_log.txt`. |
+
+Another option from Google: [Google Takeout](https://takeout.google.com) can export some
+Gemini data without any tools. What it includes has varied over time.
+
+## Run from source
+
+```powershell
+git clone https://github.com/ADPCCustoms/gemini-image-downloader.git
+cd gemini-image-downloader
+python -m pip install -r requirements.txt
+python gemini_image_downloader.py
+```
+
+Add `--debug` for detailed diagnostic output.
+
+## Build from source
+
+Requires Windows and Python 3.10+.
+
+```powershell
+build.bat
+```
+
+The program is created at `dist\GeminiImageDownloader.exe`. To use a different icon, replace
+`icon.ico` before building.
+
+Releases are built automatically by GitHub Actions: pushing a tag such as `v1.0.0` builds the
+exe and attaches it, with a SHA-256 checksum, to a GitHub release.
+
+## How it works
+
+The tool uses [Playwright](https://playwright.dev/python/) to drive your installed browser. It
+opens Gemini, clicks **Library**, scrolls until everything has loaded, collects the image
+URLs, and downloads each one at full size. It's an interface-level tool, not an official API,
+which is why it can break when the page layout changes. Fixes and improvements are welcome.
+
+## Contributing
+
+Issues and pull requests are welcome, especially fixes for layout changes on Gemini's side.
+When reporting a problem, include the Windows version, which browser was used, and the
+text the tool printed. Remove anything personal first.
+
+## License
+
+[MIT](LICENSE)

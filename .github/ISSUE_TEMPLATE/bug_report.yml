@@ -1,0 +1,57 @@
+name: Bug report
+description: Something didn't work (for example, no images found or it can't find Library)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Gemini's page layout changes from time to time, and reports help keep this tool working.
+        **Please don't post anything private**: no login details, and blank out personal info in screenshots.
+  - type: input
+    id: version
+    attributes:
+      label: Tool version
+      description: Shown at the top of the console window when it starts (for example, 1.0)
+    validations:
+      required: true
+  - type: dropdown
+    id: how
+    attributes:
+      label: How are you running it?
+      options:
+        - GeminiImageDownloader.exe (from Releases)
+        - From source with Python
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Windows version and browser
+      description: For example, "Windows 11, Google Chrome" or "Windows 10, Microsoft Edge"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you see instead? Which step went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Console output
+      description: Copy the text from the console window. If you can, run with `--debug` and include `error_log.txt`.
+      render: shell
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshot or other details
+      description: For "no images found", attach `no_images_found.png` (blank out anything personal).
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed any personal information from this report.
+          required: true
