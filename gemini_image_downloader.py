@@ -23,7 +23,7 @@ for _name in ("stdin", "stdout", "stderr"):
 
 from playwright.async_api import async_playwright
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -154,18 +154,114 @@ async def scroll_everything_down(page):
     }""")
 
 
+INDEX_NAME = ".gemini_index.json"
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+NAME_KEY_RE = re.compile(r"^gemini_([0-9a-f]{16})\.")
+
+
 def image_key(src):
     """Stable name for an image so re-runs can skip ones already saved."""
     full = re.sub(r"=[sw]\d+.*$", "=s0", src)
     return hashlib.md5(full.encode()).hexdigest()[:16], full
 
 
-async def save_image(page, ctx, src, out_dir):
-    """Returns 'saved', or 'skipped' if this image is already in the folder."""
-    key, full = image_key(src)
-    if any(out_dir.glob(f"gemini_{key}.*")):
-        return "skipped"
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
 
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class ImageIndex:
+    """Remembers which images are already in the save folder, by their *content*.
+    That way an image is recognised even if its web address changed since last time,
+    or it was downloaded earlier by an older version of this tool."""
+
+    def __init__(self, out_dir):
+        self.out_dir = out_dir
+        self.path = out_dir / INDEX_NAME
+        self.files = {}    # file name -> {"size", "mtime", "hash"}
+        self.urls = {}     # image key (from its web address) -> content hash
+        self.hashes = {}   # content hash -> file name
+        self.dirty = False
+
+    def load(self, ui):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            old_files, old_urls = data.get("files", {}), data.get("urls", {})
+        except Exception:
+            old_files, old_urls = {}, {}
+
+        names = [p for p in self.out_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+        total = len(names)
+
+        def cached(p):
+            rec = old_files.get(p.name)
+            st = p.stat()
+            return rec if rec and rec.get("size") == st.st_size and rec.get("mtime") == int(st.st_mtime) else None
+
+        todo = sum(1 for p in names if cached(p) is None)
+        if todo:
+            ui.log(f"Checking {todo} images already in this folder so they aren't downloaded twice "
+                   "(this can take a minute the first time)...")
+
+        files, self.urls = {}, dict(old_urls)
+        for n, p in enumerate(names, 1):
+            ui.check()
+            rec = cached(p)
+            if rec is None:
+                st = p.stat()
+                rec = {"size": st.st_size, "mtime": int(st.st_mtime), "hash": sha256_file(p)}
+                self.dirty = True
+            files[p.name] = rec
+            self.hashes.setdefault(rec["hash"], p.name)
+            m = NAME_KEY_RE.match(p.name)
+            if m:
+                self.urls[m.group(1)] = rec["hash"]
+            if todo and n % 25 == 0:
+                ui.progress(n, total)
+                ui.status(f"Checking existing images... {n}/{total}")
+        if set(files) != set(old_files):
+            self.dirty = True
+        self.files = files
+        self.urls = {k: v for k, v in self.urls.items() if v in self.hashes}
+        if total:
+            ui.log(f"{total} images are already in this folder.")
+
+    def has_url(self, key):
+        return self.urls.get(key) in self.hashes
+
+    def has_hash(self, h):
+        return h in self.hashes
+
+    def alias(self, key, h):
+        if self.urls.get(key) != h:
+            self.urls[key] = h
+            self.dirty = True
+
+    def add(self, key, h, path):
+        st = path.stat()
+        self.files[path.name] = {"size": st.st_size, "mtime": int(st.st_mtime), "hash": h}
+        self.hashes[h] = path.name
+        self.urls[key] = h
+        self.dirty = True
+
+    def save(self):
+        if not self.dirty:
+            return
+        try:
+            self.path.write_text(json.dumps({"files": self.files, "urls": self.urls}), encoding="utf-8")
+            self.dirty = False
+        except Exception:
+            pass
+
+
+async def fetch_image(page, ctx, src, full):
     if src.startswith("blob:") or src.startswith("data:"):
         b64 = await page.evaluate("""async (u) => {
             const b = await (await fetch(u)).blob();
@@ -175,21 +271,99 @@ async def save_image(page, ctx, src, out_dir):
                 fr.readAsDataURL(b);
             });
         }""", src)
-        body, ctype = base64.b64decode(b64), ""
-    else:
-        r = await ctx.request.get(full)
-        if not r.ok:
-            raise RuntimeError(f"download failed (HTTP {r.status})")
-        body, ctype = await r.body(), r.headers.get("content-type", "")
+        return base64.b64decode(b64), ""
+    r = await ctx.request.get(full)
+    if not r.ok:
+        raise RuntimeError(f"download failed (HTTP {r.status})")
+    return await r.body(), r.headers.get("content-type", "")
+
+
+async def save_image(page, ctx, src, out_dir, index):
+    """Returns 'saved', or 'skipped' if an identical image is already in the folder."""
+    key, full = image_key(src)
+    if index.has_url(key):
+        return "skipped"                      # quick check by web address
+
+    body, ctype = await fetch_image(page, ctx, src, full)
+    h = sha256_bytes(body)
+    if index.has_hash(h):                     # same picture already saved (maybe under another name)
+        index.alias(key, h)
+        return "skipped"
 
     ext = {"image/jpeg": "jpg", "image/webp": "webp"}.get(ctype)
     if not ext:
         ext = "jpg" if body[:3] == b"\xff\xd8\xff" else "webp" if body[8:12] == b"WEBP" else "png"
-    (out_dir / f"gemini_{key}.{ext}").write_bytes(body)
+    path = out_dir / f"gemini_{key}.{ext}"
+    path.write_bytes(body)
+    index.add(key, h, path)
     return "saved"
 
 
-async def session(ui, ctx, out_dir):
+async def scroll_to_top(page):
+    await page.evaluate("""() => {
+        const els = [document.scrollingElement, ...document.querySelectorAll('*')];
+        for (const el of els) {
+            if (el && el.scrollHeight > el.clientHeight + 50) el.scrollTop = 0;
+        }
+    }""")
+
+
+async def collect_images(ui, page):
+    """Scroll the whole Library (up to 3 passes, until a pass finds nothing new)
+    and return one web address per distinct image."""
+    best = {}      # src -> sighting with the largest size
+
+    def sighting(im):
+        if im["w"] < MIN_SIZE or im["h"] < MIN_SIZE or is_ui_image(im["src"]):
+            return
+        old = best.get(im["src"])
+        if old is None or im["w"] * im["h"] > old["w"] * old["h"]:
+            best[im["src"]] = im
+
+    def distinct():
+        return len({image_key(src)[0] for src in best})
+
+    async def grab():
+        for im in await page.evaluate(COLLECT_JS):
+            sighting(im)
+
+    previous = -1
+    for pass_no in range(1, 4):
+        if pass_no > 1:
+            ui.log(f"Checking for any missed images (pass {pass_no})...")
+            await scroll_to_top(page)
+            await page.wait_for_timeout(1500)
+        wait_ms = 1100 if pass_no == 1 else 800
+        idle, last = 0, distinct()
+        for step in range(6000):
+            ui.check()
+            await grab()
+            moved = await scroll_everything_down(page)
+            await page.wait_for_timeout(wait_ms)
+            await grab()                       # pick up images that finished loading during the wait
+            now = distinct()
+            idle = idle + 1 if (moved < 5 and now == last) else 0
+            last = now
+            if idle >= 6:
+                break
+            if step % 5 == 0:
+                ui.status(f"Loading your images... found {now} so far (pass {pass_no})")
+        total = distinct()
+        ui.log(f"  pass {pass_no}: {total} images")
+        if total == previous:
+            break
+        previous = total
+
+    by_key = {}
+    for src, im in best.items():
+        k = image_key(src)[0]
+        size = im["w"] * im["h"]
+        if k not in by_key or size > by_key[k][1]:
+            by_key[k] = (src, size)
+    return [v[0] for v in by_key.values()]
+
+
+async def session(ui, ctx, out_dir, index):
     page = await ctx.new_page()
     await safe_goto(page, GEMINI_URL)
     ui.log("A browser window has opened on Gemini.")
@@ -224,23 +398,7 @@ async def session(ui, ctx, out_dir):
     # ---- Scroll to load everything ----
     ui.log("Loading your images (this can take a few minutes if you have a lot)...")
     ui.progress(None, None)
-    found, idle = {}, 0
-    for step in range(3000):
-        ui.check()
-        for im in await page.evaluate(COLLECT_JS):
-            found[im["src"]] = im
-        moved = await scroll_everything_down(page)
-        await page.wait_for_timeout(900)
-        idle = idle + 1 if moved < 5 else 0
-        if idle >= 3:
-            break
-        if step % 5 == 0:
-            real = sum(1 for im in found.values()
-                       if im["w"] >= MIN_SIZE and im["h"] >= MIN_SIZE and not is_ui_image(im["src"]))
-            ui.status(f"Loading your images... found {real} so far")
-
-    candidates = [im["src"] for im in found.values()
-                  if im["w"] >= MIN_SIZE and im["h"] >= MIN_SIZE and not is_ui_image(im["src"])]
+    candidates = await collect_images(ui, page)
 
     if not candidates:
         shot = BASE / "no_images_found.png"
@@ -254,14 +412,16 @@ async def session(ui, ctx, out_dir):
 
     # ---- Save ----
     total = len(candidates)
-    ui.log(f"Found {total} images. Saving to: {out_dir}")
+    ui.log(f"Found {total} images in your Library. Saving new ones to: {out_dir}")
     saved = skipped = failed = 0
     for n, src in enumerate(candidates, 1):
         ui.check()
         try:
-            result = await save_image(page, ctx, src, out_dir)
+            result = await save_image(page, ctx, src, out_dir, index)
             if result == "saved":
                 saved += 1
+                if saved % 50 == 0:
+                    index.save()
             else:
                 skipped += 1
         except Cancelled:
@@ -273,8 +433,8 @@ async def session(ui, ctx, out_dir):
         ui.progress(n, total)
         ui.status(f"Saving images... {n}/{total}")
         if n % 50 == 0 or n == total:
-            ui.log(f"  {n}/{total} done ({saved} saved, {skipped} already had, {failed} failed)")
-    return {"saved": saved, "skipped": skipped, "failed": failed}
+            ui.log(f"  {n}/{total} done ({saved} new, {skipped} already in folder, {failed} failed)")
+    return {"saved": saved, "skipped": skipped, "failed": failed, "total": total}
 
 
 async def run(ui, out_dir):
@@ -282,27 +442,35 @@ async def run(ui, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     PROFILES.mkdir(exist_ok=True)
 
-    async with async_playwright() as p:
-        ctx = await launch_browser(p, ui)
-        if ctx is None:
-            ui.alert("Couldn't find Google Chrome or Microsoft Edge on this computer.\n"
-                     "Please install Google Chrome (https://www.google.com/chrome) and try again.")
-            return
-        try:
-            result = await session(ui, ctx, out_dir)
-        finally:
+    index = ImageIndex(out_dir)
+    index.load(ui)
+    ui.progress(0, 1)
+
+    try:
+        async with async_playwright() as p:
+            ctx = await launch_browser(p, ui)
+            if ctx is None:
+                ui.alert("Couldn't find Google Chrome or Microsoft Edge on this computer.\n"
+                         "Please install Google Chrome (https://www.google.com/chrome) and try again.")
+                return
             try:
-                await ctx.close()
-            except Exception:
-                pass
+                result = await session(ui, ctx, out_dir, index)
+            finally:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+    finally:
+        index.save()
 
     if result:
         ui.log("")
         ui.log("All done!")
-        ui.log(f"  New images saved:      {result['saved']}")
-        ui.log(f"  Already downloaded:    {result['skipped']}")
+        ui.log(f"  Images in your Library:       {result['total']}")
+        ui.log(f"  New images saved:             {result['saved']}")
+        ui.log(f"  Already in your folder:       {result['skipped']}")
         if result["failed"]:
-            ui.log(f"  Failed:                {result['failed']}  (run it again to retry these)")
+            ui.log(f"  Failed:                       {result['failed']}  (run it again to retry these)")
         ui.log(f"Your images are in: {out_dir}")
         ui.status("Done.")
         try:

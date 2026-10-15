@@ -18,7 +18,7 @@ Download all the images in your Gemini <b>Library</b> to your PC in one go, with
 - Saves your Gemini Library images in full size into a single folder
 - Runs **100% locally**: you sign in to your own Google account in a normal browser window, and nothing is uploaded anywhere
 - Uses your installed **Google Chrome or Microsoft Edge**, no extra browser download
-- **Safe to re-run**: skips images it has already saved, so you only get new ones
+- **Safe to re-run**: recognises images you already have (even ones saved by older versions or under other names) and only downloads new ones
 - A clean, modern window with **light and dark modes** (follows Windows by default, or pick Light/Dark), a progress bar, a Stop button and a choice of save folder
 - Friendly messages if something goes wrong
 - Windows `.exe` available, no Python needed
@@ -37,6 +37,11 @@ Download all the images in your Gemini <b>Library</b> to your PC in one go, with
 6. Wait while it scrolls through your Library and saves the images (large libraries can take
    several minutes). Don't close the browser window. You can click **Stop** at any time.
 7. When it finishes, the folder with your images opens.
+
+**Already have images?** Pick the folder that holds them as the save folder. The tool recognises
+pictures it (or an older version) already saved, by their content, and skips them. The first run
+with a big folder takes a minute to check what's there; the result is remembered in a hidden
+`.gemini_index.json` file in that folder.
 
 Use the **Auto / Light / Dark** switch at the top right to change the look; it remembers your choice.
 
