@@ -8,7 +8,7 @@ cd /d "%~dp0"
 echo Working in: %cd%
 echo.
 
-python -m pip install --upgrade playwright customtkinter pyinstaller
+python -m pip install --upgrade playwright customtkinter pillow pyinstaller
 
 REM Remove old build output so an old icon can't be reused
 if exist build rmdir /s /q build

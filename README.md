@@ -18,7 +18,7 @@ Download all the images in your Gemini <b>Library</b> to your PC in one go, with
 - Saves your Gemini Library images in full size into a single folder
 - Runs **100% locally**: you sign in to your own Google account in a normal browser window, and nothing is uploaded anywhere
 - Uses your installed **Google Chrome or Microsoft Edge**, no extra browser download
-- **Safe to re-run**: recognises images you already have (even ones saved by older versions or under other names) and only downloads new ones
+- **Safe to re-run**: recognises pictures you already have (even ones saved by older versions, under other names, or with different file metadata) and only saves new ones
 - A clean, modern window with **light and dark modes** (follows Windows by default, or pick Light/Dark), a progress bar, a Stop button and a choice of save folder
 - Friendly messages if something goes wrong
 - Windows `.exe` available, no Python needed
@@ -39,9 +39,10 @@ Download all the images in your Gemini <b>Library</b> to your PC in one go, with
 7. When it finishes, the folder with your images opens.
 
 **Already have images?** Pick the folder that holds them as the save folder. The tool recognises
-pictures it (or an older version) already saved, by their content, and skips them. The first run
-with a big folder takes a minute to check what's there; the result is remembered in a hidden
-`.gemini_index.json` file in that folder.
+pictures it (or an older version) already saved by comparing the pictures themselves, so copies
+are skipped even if the files differ in hidden metadata. The first run with a big folder takes a
+few minutes to check what's there; the result is remembered in a hidden `.gemini_index.json`
+file in that folder.
 
 Use the **Auto / Light / Dark** switch at the top right to change the look; it remembers your choice.
 
@@ -100,6 +101,13 @@ The program is created at `dist\GeminiImageDownloader.exe`. To use a different i
 
 The exe is built as a windowed app (no console). Releases are built automatically by GitHub Actions: pushing a tag such as `v1.0.0` builds the
 exe and attaches it, with a SHA-256 checksum, to a GitHub release.
+
+## Cleaning up duplicates
+
+If a folder already has repeat copies from several runs, `tools/find_duplicates.py` finds pictures
+that a later run saved again and moves them into a `_duplicates` sub-folder (it never deletes
+anything). It needs Pillow: `python -m pip install pillow`. Run it without `--move` first to see
+a report.
 
 ## How it works
 

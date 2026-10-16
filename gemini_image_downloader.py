@@ -12,7 +12,9 @@ Gemini's web page layout, so it may stop working if Google changes the site.
 Options:  --cli    run in the console instead of the window
           --debug  extra diagnostic output
 """
-import asyncio, base64, hashlib, json, os, queue, re, sys, threading, traceback
+import asyncio, base64, hashlib, io, json, os, queue, re, sys, threading, traceback
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -23,7 +25,12 @@ for _name in ("stdin", "stdout", "stderr"):
 
 from playwright.async_api import async_playwright
 
-VERSION = "1.2.1"
+try:
+    from PIL import Image
+except Exception:      # Pillow missing: fall back to exact-file matching only
+    Image = None
+
+VERSION = "1.2.2"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -157,6 +164,7 @@ async def scroll_everything_down(page):
 INDEX_NAME = ".gemini_index.json"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 NAME_KEY_RE = re.compile(r"^gemini_([0-9a-f]{16})\.")
+CONCURRENCY = 6          # images downloaded at the same time
 
 
 def image_key(src):
@@ -169,26 +177,63 @@ def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def pixel_fingerprint(data):
+    """(pixel hash, 256-bit difference hash, width, height) of the decoded picture, or None.
+    Ignores file metadata and compression, so two downloads of the same picture match
+    even when the files themselves differ byte for byte."""
+    if Image is None:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            w, h = im.size
+            pix = hashlib.sha256(im.convert("RGBA").tobytes()).hexdigest()
+            px = im.convert("L").resize((17, 16), Image.LANCZOS).tobytes()
+        bits = 0
+        for row in range(16):
+            for col in range(16):
+                bits = (bits << 1) | (px[row * 17 + col] > px[row * 17 + col + 1])
+        return pix, bits, w, h
+    except Exception:
+        return None
+
+
+def url_shape(src):
+    """Describes the *form* of an image address with the long private tokens hidden."""
+    if src.startswith(("blob:", "data:")):
+        return src.split(":")[0] + ":"
+    u = urlparse(src)
+    parts = []
+    for seg in (s for s in u.path.split("/") if s):
+        base = seg.split("=")[0]
+        parts.append(base if len(base) <= 12 else f"<{len(base)} chars>")
+    m = re.search(r"=([A-Za-z0-9_-]+)$", u.path)
+    tail = "=" + re.sub(r"\d+", "#", m.group(1)) if m else ""
+    return f"{u.netloc}/{'/'.join(parts)}{tail}{'?query' if u.query else ''}"
 
 
 class ImageIndex:
-    """Remembers which images are already in the save folder, by their *content*.
-    That way an image is recognised even if its web address changed since last time,
-    or it was downloaded earlier by an older version of this tool."""
+    """Remembers which images are already in the save folder. An image counts as already
+    saved if its web address, its file contents, or its decoded picture matches - so copies
+    are recognised even when the address changed, or the file differs only in metadata."""
 
     def __init__(self, out_dir):
         self.out_dir = out_dir
         self.path = out_dir / INDEX_NAME
-        self.files = {}    # file name -> {"size", "mtime", "hash"}
-        self.urls = {}     # image key (from its web address) -> content hash
-        self.hashes = {}   # content hash -> file name
+        self.files = {}    # file name -> {"size","mtime","hash","pix","dh","w","h"}
+        self.urls = {}     # image key (from its web address) -> file content hash
+        self.hashes = {}   # file content hash -> file name
+        self.pix = {}      # decoded-picture hash -> file name
+        self.near = defaultdict(list)   # (w, h, ext) -> [(difference hash, size, name)]
         self.dirty = False
+
+    def _register(self, name, rec):
+        self.files[name] = rec
+        self.hashes.setdefault(rec["hash"], name)
+        if rec.get("pix"):
+            self.pix.setdefault(rec["pix"], name)
+        if rec.get("dh"):
+            ext = Path(name).suffix.lower().lstrip(".")
+            self.near[(rec["w"], rec["h"], ext)].append((int(rec["dh"], 16), rec["size"], name))
 
     def load(self, ui):
         try:
@@ -203,32 +248,45 @@ class ImageIndex:
         def cached(p):
             rec = old_files.get(p.name)
             st = p.stat()
-            return rec if rec and rec.get("size") == st.st_size and rec.get("mtime") == int(st.st_mtime) else None
+            if rec and rec.get("size") == st.st_size and rec.get("mtime") == int(st.st_mtime) \
+                    and ("pix" in rec or Image is None):
+                return rec
+            return None
 
-        todo = sum(1 for p in names if cached(p) is None)
-        if todo:
-            ui.log(f"Checking {todo} images already in this folder so they aren't downloaded twice "
-                   "(this can take a minute the first time)...")
+        recs = {p.name: cached(p) for p in names}
+        need = [p for p in names if recs[p.name] is None]
+        if need:
+            ui.log(f"Checking {len(need)} images already in this folder so they aren't downloaded "
+                   "twice (this can take a few minutes the first time)...")
 
-        files, self.urls = {}, dict(old_urls)
-        for n, p in enumerate(names, 1):
-            ui.check()
-            rec = cached(p)
-            if rec is None:
-                st = p.stat()
-                rec = {"size": st.st_size, "mtime": int(st.st_mtime), "hash": sha256_file(p)}
-                self.dirty = True
-            files[p.name] = rec
-            self.hashes.setdefault(rec["hash"], p.name)
-            m = NAME_KEY_RE.match(p.name)
+            def work(p):
+                data = p.read_bytes()
+                return sha256_bytes(data), pixel_fingerprint(data)
+
+            ex = ThreadPoolExecutor(max_workers=6)
+            try:
+                for n, (p, (h, fp)) in enumerate(zip(need, ex.map(work, need)), 1):
+                    ui.check()
+                    st = p.stat()
+                    recs[p.name] = {"size": st.st_size, "mtime": int(st.st_mtime), "hash": h,
+                                    "pix": fp[0] if fp else "", "dh": format(fp[1], "x") if fp else "",
+                                    "w": fp[2] if fp else 0, "h": fp[3] if fp else 0}
+                    if n % 25 == 0:
+                        ui.progress(n, len(need))
+                        ui.status(f"Checking existing images... {n}/{len(need)}")
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
+            self.dirty = True
+
+        for name, rec in recs.items():
+            self._register(name, rec)
+        if set(recs) != set(old_files):
+            self.dirty = True
+        self.urls = dict(old_urls)
+        for name, rec in recs.items():
+            m = NAME_KEY_RE.match(name)
             if m:
                 self.urls[m.group(1)] = rec["hash"]
-            if todo and n % 25 == 0:
-                ui.progress(n, total)
-                ui.status(f"Checking existing images... {n}/{total}")
-        if set(files) != set(old_files):
-            self.dirty = True
-        self.files = files
         self.urls = {k: v for k, v in self.urls.items() if v in self.hashes}
         if total:
             ui.log(f"{total} images are already in this folder.")
@@ -236,18 +294,28 @@ class ImageIndex:
     def has_url(self, key):
         return self.urls.get(key) in self.hashes
 
-    def has_hash(self, h):
-        return h in self.hashes
+    def find_pixel(self, pix):
+        return self.pix.get(pix)
 
-    def alias(self, key, h):
+    def find_near(self, dh, w, h, ext, size):
+        """Same size and type, almost the same picture, almost the same file size."""
+        for odh, osize, name in self.near.get((w, h, ext), ()):
+            if (dh ^ odh).bit_count() <= 1 and abs(size - osize) <= 0.02 * max(size, osize):
+                return name
+        return None
+
+    def alias(self, key, name):
+        h = self.files[name]["hash"]
         if self.urls.get(key) != h:
             self.urls[key] = h
             self.dirty = True
 
-    def add(self, key, h, path):
+    def add(self, key, h, path, fp):
         st = path.stat()
-        self.files[path.name] = {"size": st.st_size, "mtime": int(st.st_mtime), "hash": h}
-        self.hashes[h] = path.name
+        rec = {"size": st.st_size, "mtime": int(st.st_mtime), "hash": h,
+               "pix": fp[0] if fp else "", "dh": format(fp[1], "x") if fp else "",
+               "w": fp[2] if fp else 0, "h": fp[3] if fp else 0}
+        self._register(path.name, rec)
         self.urls[key] = h
         self.dirty = True
 
@@ -278,25 +346,30 @@ async def fetch_image(page, ctx, src, full):
     return await r.body(), r.headers.get("content-type", "")
 
 
-async def save_image(page, ctx, src, out_dir, index):
-    """Returns 'saved', or 'skipped' if an identical image is already in the folder."""
+async def save_image(page, ctx, src, out_dir, index, lock):
+    """Returns ('skipped', 'address' | 'content') or ('saved', 'new')."""
     key, full = image_key(src)
     if index.has_url(key):
-        return "skipped"                      # quick check by web address
+        return "skipped", "address"           # quick check by web address
 
     body, ctype = await fetch_image(page, ctx, src, full)
     h = sha256_bytes(body)
-    if index.has_hash(h):                     # same picture already saved (maybe under another name)
-        index.alias(key, h)
-        return "skipped"
-
     ext = {"image/jpeg": "jpg", "image/webp": "webp"}.get(ctype)
     if not ext:
         ext = "jpg" if body[:3] == b"\xff\xd8\xff" else "webp" if body[8:12] == b"WEBP" else "png"
-    path = out_dir / f"gemini_{key}.{ext}"
-    path.write_bytes(body)
-    index.add(key, h, path)
-    return "saved"
+    fp = await asyncio.get_running_loop().run_in_executor(None, pixel_fingerprint, body)
+
+    async with lock:                          # check-and-save as one step, so parallel downloads can't both save it
+        name = index.hashes.get(h)
+        if name is None and fp:
+            name = index.find_pixel(fp[0]) or index.find_near(fp[1], fp[2], fp[3], ext, len(body))
+        if name:
+            index.alias(key, name)
+            return "skipped", "content"
+        path = out_dir / f"gemini_{key}.{ext}"
+        path.write_bytes(body)
+        index.add(key, h, path, fp)
+        return "saved", "new"
 
 
 async def scroll_to_top(page):
@@ -413,28 +486,54 @@ async def session(ui, ctx, out_dir, index):
     # ---- Save ----
     total = len(candidates)
     ui.log(f"Found {total} images in your Library. Saving new ones to: {out_dir}")
-    saved = skipped = failed = 0
-    for n, src in enumerate(candidates, 1):
-        ui.check()
-        try:
-            result = await save_image(page, ctx, src, out_dir, index)
-            if result == "saved":
-                saved += 1
-                if saved % 50 == 0:
-                    index.save()
+    stats = Counter()
+    per_shape = defaultdict(Counter)
+    lock, sem = asyncio.Lock(), asyncio.Semaphore(CONCURRENCY)
+
+    async def work(src):
+        async with sem:
+            ui.check()
+            try:
+                return src, await save_image(page, ctx, src, out_dir, index, lock), None
+            except Cancelled:
+                raise
+            except Exception as e:
+                return src, None, e
+
+    tasks = [asyncio.ensure_future(work(s)) for s in candidates]
+    try:
+        for n, fut in enumerate(asyncio.as_completed(tasks), 1):
+            src, result, err = await fut
+            shape = url_shape(src)
+            if err is not None:
+                stats["failed"] += 1
+                per_shape[shape]["failed"] += 1
+                if DEBUG or stats["failed"] <= 3:
+                    ui.log(f"  could not save one image: {err}")
             else:
-                skipped += 1
-        except Cancelled:
-            raise
-        except Exception as e:
-            failed += 1
-            if DEBUG or failed <= 3:
-                ui.log(f"  could not save one image: {e}")
-        ui.progress(n, total)
-        ui.status(f"Saving images... {n}/{total}")
-        if n % 50 == 0 or n == total:
-            ui.log(f"  {n}/{total} done ({saved} new, {skipped} already in folder, {failed} failed)")
-    return {"saved": saved, "skipped": skipped, "failed": failed, "total": total}
+                status, how = result
+                stats[how] += 1
+                per_shape[shape][how] += 1
+                if status == "saved" and stats["new"] % 50 == 0:
+                    index.save()
+            ui.progress(n, total)
+            ui.status(f"Saving images... {n}/{total}")
+            if n % 50 == 0 or n == total:
+                ui.log(f"  {n}/{total} done ({stats['new']} new, "
+                       f"{stats['address'] + stats['content']} already in folder, {stats['failed']} failed)")
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    ui.log("Image address types (private parts hidden):")
+    for shape, c in sorted(per_shape.items(), key=lambda kv: -sum(kv[1].values()))[:6]:
+        ui.log(f"  {sum(c.values())} x {shape}: {c['address']} matched by address, "
+               f"{c['content']} by picture, {c['new']} new")
+    return {"saved": stats["new"], "skipped": stats["address"] + stats["content"],
+            "by_address": stats["address"], "by_content": stats["content"],
+            "failed": stats["failed"], "total": total}
 
 
 async def run(ui, out_dir):
@@ -468,7 +567,8 @@ async def run(ui, out_dir):
         ui.log("All done!")
         ui.log(f"  Images in your Library:       {result['total']}")
         ui.log(f"  New images saved:             {result['saved']}")
-        ui.log(f"  Already in your folder:       {result['skipped']}")
+        ui.log(f"  Already in your folder:       {result['skipped']}  "
+               f"({result['by_address']} by address, {result['by_content']} by picture)")
         if result["failed"]:
             ui.log(f"  Failed:                       {result['failed']}  (run it again to retry these)")
         ui.log(f"Your images are in: {out_dir}")
