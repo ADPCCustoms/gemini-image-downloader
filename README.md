@@ -35,7 +35,7 @@ Download all the images in your Gemini <b>Library</b> to your PC in one go, with
 5. A browser window opens on Gemini. Sign in if asked and wait until your chats are visible,
    then click **Continue** in the yellow box in the tool's window.
 6. Wait while it scrolls through your Library and saves the images (large libraries can take
-   several minutes). Don't close the browser window. You can click **Stop** at any time.
+   several minutes). Don't close the browser window, and keep it visible (not minimised or hidden behind other windows) while it loads. You can click **Stop** at any time.
 7. When it finishes, the folder with your images opens.
 
 **Already have images?** Pick the folder that holds them as the save folder. The tool recognises
