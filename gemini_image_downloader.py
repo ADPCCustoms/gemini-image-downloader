@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -230,6 +230,7 @@ class ImageIndex:
         self.near = defaultdict(list)   # (w, h, ext) -> [(difference hash, size, name)]
         self.dirty = False
         self.library_total = 0   # how many Library images the last complete run found
+        self.last_short = 0      # count found by the last run that ended short of the expected size
 
     def _register(self, name, rec):
         self.files[name] = rec
@@ -245,6 +246,7 @@ class ImageIndex:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             old_files, old_urls = data.get("files", {}), data.get("urls", {})
             self.library_total = int(data.get("library_total", 0))
+            self.last_short = int(data.get("last_short", 0))
         except Exception:
             old_files, old_urls = {}, {}
 
@@ -300,6 +302,13 @@ class ImageIndex:
     def has_url(self, key):
         return self.urls.get(key) in self.hashes
 
+    def expected_library_size(self):
+        """How many images the Library should hold: what the last complete run found, or, before
+        any run has recorded that, the number of images this tool has already saved here."""
+        if self.library_total:
+            return self.library_total
+        return sum(1 for n in self.files if n.startswith("gemini_"))
+
     def find_pixel(self, pix):
         return self.pix.get(pix)
 
@@ -330,7 +339,8 @@ class ImageIndex:
             return
         try:
             self.path.write_text(json.dumps({"files": self.files, "urls": self.urls,
-                                                 "library_total": self.library_total}), encoding="utf-8")
+                                                 "library_total": self.library_total,
+                                                 "last_short": self.last_short}), encoding="utf-8")
             self.dirty = False
         except Exception:
             pass
@@ -398,11 +408,25 @@ async def scroll_to_top(page):
     }""")
 
 
-async def collect_images(ui, page, expected=0):
-    """Scroll the whole Library (up to 3 passes, until a pass finds nothing new)
-    and return one web address per distinct image. If far fewer images turn up than
-    on the last run, look again more slowly in case Gemini hadn't finished loading."""
-    best = {}      # src -> sighting with the largest size
+def count_distinct(best):
+    return len({image_key(src)[0] for src in best})
+
+
+async def nudge_bottom(page):
+    """Real mouse-wheel and End-key presses, in case the page only loads more on those."""
+    try:
+        vp = page.viewport_size or {"width": 1280, "height": 720}
+        await page.mouse.move(vp["width"] / 2, vp["height"] / 2)
+        await page.mouse.wheel(0, 800)
+        await page.keyboard.press("End")
+    except Exception:
+        pass
+
+
+async def collect_images(ui, page, expected=0, best=None, passes=3):
+    """Scroll the whole Library (up to `passes` passes, stopping when a pass finds nothing new)
+    and return one web address per distinct image. `best` accumulates what has been seen."""
+    best = {} if best is None else best     # src -> sighting with the largest size
 
     def sighting(im):
         if im["w"] < MIN_SIZE or im["h"] < MIN_SIZE or is_ui_image(im["src"]):
@@ -412,7 +436,7 @@ async def collect_images(ui, page, expected=0):
             best[im["src"]] = im
 
     def distinct():
-        return len({image_key(src)[0] for src in best})
+        return count_distinct(best)
 
     async def grab():
         for im in await page.evaluate(COLLECT_JS):
@@ -427,16 +451,19 @@ async def collect_images(ui, page, expected=0):
             await page.wait_for_timeout(wait_ms)
             await grab()                       # pick up images that finished loading during the wait
             now = distinct()
-            idle = idle + 1 if (moved < 5 and now == last) else 0
+            stalled = moved < 5 and now == last
+            idle = idle + 1 if stalled else 0
             last = now
             if idle >= idle_limit:
                 break
+            if stalled and idle in (2, 4):
+                await nudge_bottom(page)
             if step % 5 == 0:
                 ui.status(f"Loading your images... found {now} so far ({label})")
         return distinct()
 
     previous = -1
-    for pass_no in range(1, 4):
+    for pass_no in range(1, passes + 1):
         if pass_no > 1:
             ui.log(f"Checking for any missed images (pass {pass_no})...")
             await scroll_to_top(page)
@@ -446,22 +473,6 @@ async def collect_images(ui, page, expected=0):
         if total == previous:
             break
         previous = total
-
-    for retry in range(1, 4):
-        now = distinct()
-        if not expected or now >= 0.95 * expected:
-            break
-        ui.log(f"Found {now} images, but last time your Library had {expected}. "
-               f"Gemini may not have finished loading; looking again more slowly (try {retry} of 3)...")
-        await page.wait_for_timeout(5000)
-        await scroll_to_top(page)
-        await page.wait_for_timeout(2000)
-        total = await one_pass(f"slow look {retry}", 2200, 8)
-        ui.log(f"  slow look {retry}: {total} images")
-    now = distinct()
-    if expected and now < 0.95 * expected:
-        ui.log(f"Still only {now} images (last time: {expected}). If you haven't deleted images, "
-               "keep the browser window visible and click Start again.")
 
     by_key = {}
     for src, im in best.items():
@@ -507,7 +518,40 @@ async def session(ui, ctx, out_dir, index):
     # ---- Scroll to load everything ----
     ui.log("Loading your images (this can take a few minutes if you have a lot)...")
     ui.progress(None, None)
-    candidates = await collect_images(ui, page, index.library_total)
+    expected = index.expected_library_size()
+    best = {}
+    candidates = await collect_images(ui, page, expected, best)
+    counts = [count_distinct(best)]
+    for attempt in (1, 2):
+        if not expected or counts[-1] >= 0.95 * expected:
+            break
+        if len(counts) > 1 and counts[-1] == counts[-2]:
+            break                                  # the last reload found nothing new
+        ui.log(f"Found {counts[-1]} images but expected about {expected}. Gemini may not have "
+               f"finished loading, so reloading the Library to look again ({attempt} of 2)...")
+        await safe_goto(page, GEMINI_URL)
+        await page.wait_for_timeout(5000)
+        if not await click_section(page, SECTION):
+            await ask(ui, f"Couldn't find '{SECTION}' in the Gemini sidebar. Click '{SECTION}' in the "
+                          "browser window, then continue.")
+        await page.wait_for_timeout(6000)
+        candidates = await collect_images(ui, page, expected, best, passes=1)
+        counts.append(count_distinct(best))
+
+    found = counts[-1]
+    if expected and found < 0.95 * expected:
+        ui.log(f"Only {found} images found (expected about {expected}). If you haven't deleted images "
+               "from Gemini, keep the browser window visible and click Start again.")
+        if index.last_short == found:
+            ui.log(f"That's the same count as the last short run, so {found} will be treated as the "
+                   "size of your Library from now on.")
+            index.library_total, index.last_short = found, 0
+        else:
+            index.last_short = found
+        index.dirty = True
+    elif candidates:
+        index.library_total, index.last_short = len(candidates), 0
+        index.dirty = True
 
     if not candidates:
         shot = BASE / "no_images_found.png"
@@ -521,9 +565,7 @@ async def session(ui, ctx, out_dir, index):
 
     # ---- Save ----
     total = len(candidates)
-    if total >= 0.95 * index.library_total:
-        index.library_total = total
-        index.dirty = True
+
     ui.log(f"Found {total} images in your Library. Saving new ones to: {out_dir}")
     stats = Counter()
     per_shape = defaultdict(Counter)
