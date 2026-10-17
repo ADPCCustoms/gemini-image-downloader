@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.2.6"
+VERSION = "1.2.7"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -52,10 +52,12 @@ COLLECT_JS = """() => {
     const seen = (window.__gemSeen = window.__gemSeen || new Map());
     const out = [];
     for (const e of document.querySelectorAll('img')) {
-        const src = e.currentSrc || e.src, area = e.naturalWidth * e.naturalHeight, old = seen.get(src);
+        const r = e.getBoundingClientRect();
+        const w = e.naturalWidth || Math.round(r.width), h = e.naturalHeight || Math.round(r.height);
+        const src = e.currentSrc || e.src, area = w * h, old = seen.get(src);
         if (old === undefined || area > old) {
             seen.set(src, area);
-            out.push({src: src, w: e.naturalWidth, h: e.naturalHeight});
+            out.push({src: src, w: w, h: h});
         }
     }
     return out;
@@ -183,6 +185,24 @@ def looks_signed_out(url):
     return u.netloc == "gemini.google.com" and u.path in ("", "/", "/welcome")
 
 
+LIBRARY_URL_RE = re.compile(r"^https://lh3\.googleusercontent\.com/gg/")
+
+
+def is_library_url(src):
+    return bool(LIBRARY_URL_RE.match(src))
+
+
+def qualifies(im):
+    """Is this <img> one of your Library pictures (not an icon, avatar or template)?
+    Sizes are the loaded size, or the on-screen size when the picture hasn't been loaded."""
+    src = im["src"]
+    if is_ui_image(src):
+        return False
+    if im["w"] >= MIN_SIZE and im["h"] >= MIN_SIZE:
+        return True
+    return is_library_url(src) and im["w"] >= 40 and im["h"] >= 40
+
+
 def is_ui_image(src):
     return ("gstatic.com" in src or "/ogw/" in src
             or "googleusercontent.com/a/" in src or src.endswith(".svg"))
@@ -243,6 +263,25 @@ async def scroll_everything_down(page, rescan=True):
         }
         return moved;
     }""", rescan)
+
+
+async def block_library_images(page):
+    """Stop the page downloading the Library pictures themselves while we scroll: the scan only
+    needs their addresses, and loading thousands of full pictures was most of the scan time."""
+    async def handler(route):
+        await route.abort()
+    try:
+        await page.route(LIBRARY_URL_RE, handler)
+        return handler
+    except Exception:
+        return None
+
+
+async def unblock_library_images(page, handler):
+    try:
+        await page.unroute(LIBRARY_URL_RE, handler)
+    except Exception:
+        pass
 
 
 async def settle(page, min_ms, max_ms):
@@ -532,7 +571,7 @@ async def collect_images(ui, page, expected=0, best=None, passes=3, careful=Fals
     keys = {image_key(src)[0] for src in best}
 
     def sighting(im):
-        if im["w"] < MIN_SIZE or im["h"] < MIN_SIZE or is_ui_image(im["src"]):
+        if not qualifies(im):
             return
         old = best.get(im["src"])
         if old is None or im["w"] * im["h"] > old["w"] * old["h"]:
@@ -632,6 +671,10 @@ async def session(ui, ctx, out_dir, index):
     ui.progress(None, None)
     expected = index.expected_library_size()
     best = {}
+    blocker = None
+    if expected:        # we have a size to check the result against, so scan without loading every picture
+        blocker = await block_library_images(page)
+        ui.log("Scanning the Library without loading every picture (faster)...")
     candidates = await collect_images(ui, page, expected, best)
     counts = [count_distinct(best)]
     for attempt in (1, 2):
@@ -640,7 +683,10 @@ async def session(ui, ctx, out_dir, index):
         if len(counts) > 1 and counts[-1] == counts[-2]:
             break                                  # the last reload found nothing new
         ui.log(f"Found {counts[-1]} images but expected about {expected}. Gemini may not have "
-               f"finished loading, so reloading the Library to look again ({attempt} of 2)...")
+               f"finished loading, so reloading the Library to look again carefully ({attempt} of 2)...")
+        if blocker:
+            await unblock_library_images(page, blocker)    # retry the slow, careful way
+            blocker = None
         await safe_goto(page, GEMINI_URL)
         await page.wait_for_timeout(5000)
         if not await click_section(page, SECTION):
@@ -650,6 +696,8 @@ async def session(ui, ctx, out_dir, index):
         candidates = await collect_images(ui, page, expected, best, passes=1, careful=True)
         counts.append(count_distinct(best))
 
+    if blocker:
+        await unblock_library_images(page, blocker)
     TIMING["Scanning your Library"] += (time.monotonic() - t_scan) - (TIMING["Waiting for you"] - w_scan)
     found = counts[-1]
     if expected and found < 0.95 * expected:
