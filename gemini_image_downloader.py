@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.2.5"
+VERSION = "1.2.6"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -48,8 +48,18 @@ PROFILES = BASE / "browser_profile"      # keeps you logged in between runs
 
 BROWSERS = [("chrome", "Google Chrome"), ("msedge", "Microsoft Edge")]
 
-COLLECT_JS = """() => [...document.querySelectorAll('img')]
-    .map(e => ({src: e.currentSrc || e.src, w: e.naturalWidth, h: e.naturalHeight}))"""
+COLLECT_JS = """() => {
+    const seen = (window.__gemSeen = window.__gemSeen || new Map());
+    const out = [];
+    for (const e of document.querySelectorAll('img')) {
+        const src = e.currentSrc || e.src, area = e.naturalWidth * e.naturalHeight, old = seen.get(src);
+        if (old === undefined || area > old) {
+            seen.set(src, area);
+            out.push({src: src, w: e.naturalWidth, h: e.naturalHeight});
+        }
+    }
+    return out;
+}"""
 
 
 class Cancelled(Exception):
@@ -87,6 +97,7 @@ def fmt_clock(sec):
 
 
 TIMING = defaultdict(float)     # seconds spent in each part of the current run
+COUNTS = Counter()              # numbers for the summary (downloads, bytes)
 
 
 class RunLog:
@@ -213,20 +224,43 @@ async def click_section(page, name):
     return False
 
 
-async def scroll_everything_down(page):
-    """Scroll every scrollable element down a bit; return how far anything moved."""
-    return await page.evaluate("""() => {
+async def scroll_everything_down(page, rescan=True):
+    """Scroll every scrollable element down a bit; return how far anything moved.
+    The scrollable elements are remembered between steps (rescan=True looks for them again)."""
+    return await page.evaluate("""(rescan) => {
+        let els = window.__gemScrollers;
+        if (!els || rescan) {
+            els = [document.scrollingElement, ...document.querySelectorAll('*')]
+                .filter(el => el && el.scrollHeight > el.clientHeight + 50);
+            window.__gemScrollers = els;
+        }
         let moved = 0;
-        const els = [document.scrollingElement, ...document.querySelectorAll('*')];
         for (const el of els) {
-            if (el && el.scrollHeight > el.clientHeight + 50) {
-                const before = el.scrollTop;
-                el.scrollTop = before + el.clientHeight * 0.9;
-                moved += el.scrollTop - before;
-            }
+            if (!el.isConnected) continue;
+            const before = el.scrollTop;
+            el.scrollTop = before + el.clientHeight * 0.9;
+            moved += el.scrollTop - before;
         }
         return moved;
-    }""")
+    }""", rescan)
+
+
+async def settle(page, min_ms, max_ms):
+    """Wait for newly scrolled-in images to finish loading: as soon as nothing is still loading
+    (and nothing new has appeared), carry on; never longer than max_ms."""
+    await page.wait_for_timeout(min_ms)
+    waited, prev = min_ms, None
+    while waited < max_ms:
+        state = await page.evaluate("""() => {
+            let pending = 0;
+            for (const i of document.images) if (!i.complete) pending++;
+            return [document.images.length, pending];
+        }""")
+        if state[1] == 0 and state == prev:
+            break
+        prev = state
+        await page.wait_for_timeout(150)
+        waited += 150
 
 
 INDEX_NAME = ".gemini_index.json"
@@ -429,7 +463,10 @@ async def fetch_image(page, ctx, src, full):
             last = str(e)
         else:
             if r.ok:
-                return await r.body(), r.headers.get("content-type", "")
+                body = await r.body()
+                COUNTS["downloads"] += 1
+                COUNTS["bytes"] += len(body)
+                return body, r.headers.get("content-type", "")
             last = f"HTTP {r.status}"
             if r.status not in (403, 408, 429) and r.status < 500:
                 break                          # not worth retrying (e.g. 404)
@@ -487,10 +524,12 @@ async def nudge_bottom(page):
         pass
 
 
-async def collect_images(ui, page, expected=0, best=None, passes=3):
+async def collect_images(ui, page, expected=0, best=None, passes=3, careful=False):
     """Scroll the whole Library (up to `passes` passes, stopping when a pass finds nothing new)
-    and return one web address per distinct image. `best` accumulates what has been seen."""
+    and return one web address per distinct image. `best` accumulates what has been seen.
+    careful=True always waits the full time after each scroll (slower, used when retrying)."""
     best = {} if best is None else best     # src -> sighting with the largest size
+    keys = {image_key(src)[0] for src in best}
 
     def sighting(im):
         if im["w"] < MIN_SIZE or im["h"] < MIN_SIZE or is_ui_image(im["src"]):
@@ -498,23 +537,25 @@ async def collect_images(ui, page, expected=0, best=None, passes=3):
         old = best.get(im["src"])
         if old is None or im["w"] * im["h"] > old["w"] * old["h"]:
             best[im["src"]] = im
-
-    def distinct():
-        return count_distinct(best)
+            keys.add(image_key(im["src"])[0])
 
     async def grab():
         for im in await page.evaluate(COLLECT_JS):
             sighting(im)
 
     async def one_pass(label, wait_ms, idle_limit):
-        idle, last = 0, distinct()
+        idle = 0
+        await grab()
+        last = len(keys)
         for step in range(6000):
             ui.check()
+            moved = await scroll_everything_down(page, rescan=(step % 25 == 0 or idle > 0))
+            if idle or careful:
+                await page.wait_for_timeout(wait_ms)        # stalled or careful: give the page its full time
+            else:
+                await settle(page, 250, wait_ms)            # moving: carry on as soon as images are in
             await grab()
-            moved = await scroll_everything_down(page)
-            await page.wait_for_timeout(wait_ms)
-            await grab()                       # pick up images that finished loading during the wait
-            now = distinct()
+            now = len(keys)
             stalled = moved < 5 and now == last
             idle = idle + 1 if stalled else 0
             last = now
@@ -524,7 +565,7 @@ async def collect_images(ui, page, expected=0, best=None, passes=3):
                 await nudge_bottom(page)
             if step % 5 == 0:
                 ui.status(f"Loading your images... found {now} so far ({label})")
-        return distinct()
+        return len(keys)
 
     previous = -1
     for pass_no in range(1, passes + 1):
@@ -532,10 +573,13 @@ async def collect_images(ui, page, expected=0, best=None, passes=3):
             ui.log(f"Checking for any missed images (pass {pass_no})...")
             await scroll_to_top(page)
             await page.wait_for_timeout(1500)
+        t_pass = time.monotonic()
         total = await one_pass(f"pass {pass_no}", 1100 if pass_no == 1 else 800, 6)
-        ui.log(f"  pass {pass_no}: {total} images")
+        ui.log(f"  pass {pass_no}: {total} images ({fmt_dur(time.monotonic() - t_pass)})")
         if total == previous:
             break
+        if expected and total == expected:
+            break                    # exactly what we expected: no need for a second look
         previous = total
 
     by_key = {}
@@ -603,7 +647,7 @@ async def session(ui, ctx, out_dir, index):
             await ask(ui, f"Couldn't find '{SECTION}' in the Gemini sidebar. Click '{SECTION}' in the "
                           "browser window, then continue.")
         await page.wait_for_timeout(6000)
-        candidates = await collect_images(ui, page, expected, best, passes=1)
+        candidates = await collect_images(ui, page, expected, best, passes=1, careful=True)
         counts.append(count_distinct(best))
 
     TIMING["Scanning your Library"] += (time.monotonic() - t_scan) - (TIMING["Waiting for you"] - w_scan)
@@ -694,6 +738,7 @@ async def session(ui, ctx, out_dir, index):
 async def run(ui, out_dir):
     t_run = time.monotonic()
     TIMING.clear()
+    COUNTS.clear()
     ui.banner()
     out_dir.mkdir(parents=True, exist_ok=True)
     PROFILES.mkdir(exist_ok=True)
@@ -738,6 +783,10 @@ async def run(ui, out_dir):
                      "Scanning your Library", "Saving images"):
             if TIMING[name] >= 1:
                 ui.log(f"   {name + ':':<28}{fmt_dur(TIMING[name])}")
+        if COUNTS["downloads"] and TIMING["Saving images"] >= 1:
+            mb = COUNTS["bytes"] / 1e6
+            ui.log(f"   Downloaded {COUNTS['downloads']} images ({mb:,.0f} MB, "
+                   f"{mb / TIMING['Saving images']:.1f} MB/s while saving)")
         ui.status(f"Done in {fmt_dur(took)}.")
         try:
             os.startfile(out_dir)    # open the folder (Windows)
