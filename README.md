@@ -19,6 +19,7 @@ Download all the images in your Gemini <b>Library</b> to your PC in one go, with
 - Runs **100% locally**: you sign in to your own Google account in a normal browser window, and nothing is uploaded anywhere
 - Uses your installed **Google Chrome or Microsoft Edge**, no extra browser download
 - **Safe to re-run**: recognises pictures you already have (even ones saved by older versions, under other names, or with different file metadata) and only saves new ones
+- Time-stamped progress log, a running timer, an estimate of time left and a time-taken summary when it finishes
 - A clean, modern window with **light and dark modes** (follows Windows by default, or pick Light/Dark), a progress bar, a Stop button and a choice of save folder
 - Friendly messages if something goes wrong
 - Windows `.exe` available, no Python needed
@@ -44,6 +45,8 @@ are skipped even if the files differ in hidden metadata. The first run with a bi
 few minutes to check what's there; the result is remembered in a hidden `.gemini_index.json`
 file in that folder.
 
+Every message in the log shows the time it happened, a timer at the top right counts the elapsed time, and the final summary shows how long each part took. A copy of the log is saved as `last_run_log.txt` next to the program (use the **Open log** button); it's handy to attach to a bug report.
+
 Use the **Auto / Light / Dark** switch at the top right to change the look; it remembers your choice.
 
 Run it again any time to pick up new images. To sign out, delete the `browser_profile` folder
@@ -56,7 +59,7 @@ next to the program.
 - It talks only to Gemini and Google's image servers, using your own login.
 - It writes only to the folder you choose for your images (`gemini_images/` next to the program by
   default) and to its own `browser_profile/` folder next to the program (its saved login, separate
-  from your everyday browser profile), plus a tiny `settings.json` that remembers your theme and folder choice. Only if something goes wrong it also writes `error_log.txt`
+  from your everyday browser profile), plus `last_run_log.txt` (a copy of the latest log, with your folder path and counts but no private image links) and a tiny `settings.json` that remembers your theme and folder choice. Only if something goes wrong it also writes `error_log.txt`
   or `no_images_found.png` there.
 - It doesn't read or change anything else on your computer, and it never touches your normal
   Chrome or Edge profile, passwords, history or bookmarks.

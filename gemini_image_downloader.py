@@ -12,7 +12,7 @@ Gemini's web page layout, so it may stop working if Google changes the site.
 Options:  --cli    run in the console instead of the window
           --debug  extra diagnostic output
 """
-import asyncio, base64, hashlib, io, json, os, queue, re, sys, threading, traceback
+import asyncio, base64, hashlib, io, json, os, queue, re, sys, threading, time, traceback
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -61,6 +61,66 @@ def resource_path(name):
     return base / name
 
 
+def stamp():
+    return time.strftime("%H:%M:%S")
+
+
+def stamped(msg):
+    """Prefix a log line with the time of day (blank lines stay blank)."""
+    return f"[{stamp()}] {msg}" if msg else ""
+
+
+def fmt_dur(sec):
+    """'23m 56s', '1h 02m 05s', '8s'"""
+    sec = int(round(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s" if m else f"{s}s"
+
+
+def fmt_clock(sec):
+    """'3:07' or '1:03:07' for the running timer"""
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+TIMING = defaultdict(float)     # seconds spent in each part of the current run
+
+
+class RunLog:
+    """Keeps a copy of everything shown in the log in last_run_log.txt next to the program."""
+
+    def __init__(self):
+        self.path = BASE / "last_run_log.txt"
+        self.lock = threading.Lock()
+        self.ok = True
+
+    def start(self, out_dir):
+        with self.lock:
+            try:
+                self.path.write_text(f"Gemini Image Downloader v{VERSION}\n"
+                                     f"Started {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                     f"Save folder: {out_dir}\n\n", encoding="utf-8")
+                self.ok = True
+            except Exception:
+                self.ok = False
+
+    def write(self, line):
+        if not self.ok:
+            return
+        with self.lock:
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                self.ok = False
+
+
+runlog = RunLog()
+
+
 def console_banner():
     print("=" * 60)
     print(f" Gemini Image Downloader v{VERSION}")
@@ -82,7 +142,11 @@ def console_banner():
 # ======================================================================
 
 async def ask(ui, msg):
-    await asyncio.get_running_loop().run_in_executor(None, ui.ask, msg)
+    t = time.monotonic()
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, ui.ask, msg)
+    finally:
+        TIMING["Waiting for you"] += time.monotonic() - t
 
 
 async def safe_goto(page, url, tries=3):
@@ -484,6 +548,7 @@ async def collect_images(ui, page, expected=0, best=None, passes=3):
 
 
 async def session(ui, ctx, out_dir, index):
+    t_open, w_open = time.monotonic(), TIMING["Waiting for you"]
     page = await ctx.new_page()
     await safe_goto(page, GEMINI_URL)
     ui.log("A browser window has opened on Gemini.")
@@ -515,7 +580,10 @@ async def session(ui, ctx, out_dir, index):
                       "(or wherever your images are shown) in the browser window, then continue.")
     await page.wait_for_timeout(6000)
 
+    TIMING["Opening Gemini"] += (time.monotonic() - t_open) - (TIMING["Waiting for you"] - w_open)
+
     # ---- Scroll to load everything ----
+    t_scan, w_scan = time.monotonic(), TIMING["Waiting for you"]
     ui.log("Loading your images (this can take a few minutes if you have a lot)...")
     ui.progress(None, None)
     expected = index.expected_library_size()
@@ -538,6 +606,7 @@ async def session(ui, ctx, out_dir, index):
         candidates = await collect_images(ui, page, expected, best, passes=1)
         counts.append(count_distinct(best))
 
+    TIMING["Scanning your Library"] += (time.monotonic() - t_scan) - (TIMING["Waiting for you"] - w_scan)
     found = counts[-1]
     if expected and found < 0.95 * expected:
         ui.log(f"Only {found} images found (expected about {expected}). If you haven't deleted images "
@@ -565,6 +634,7 @@ async def session(ui, ctx, out_dir, index):
 
     # ---- Save ----
     total = len(candidates)
+    t_save = time.monotonic()
 
     ui.log(f"Found {total} images in your Library. Saving new ones to: {out_dir}")
     stats = Counter()
@@ -598,7 +668,10 @@ async def session(ui, ctx, out_dir, index):
                 if status == "saved" and stats["new"] % 50 == 0:
                     index.save()
             ui.progress(n, total)
-            ui.status(f"Saving images... {n}/{total}")
+            eta = ""
+            if 50 <= n < total:
+                eta = f" (about {fmt_dur((time.monotonic() - t_save) / n * (total - n))} left)"
+            ui.status(f"Saving images... {n}/{total}{eta}")
             if n % 50 == 0 or n == total:
                 ui.log(f"  {n}/{total} done ({stats['new']} new, "
                        f"{stats['address'] + stats['content']} already in folder, {stats['failed']} failed)")
@@ -608,6 +681,7 @@ async def session(ui, ctx, out_dir, index):
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
 
+    TIMING["Saving images"] += time.monotonic() - t_save
     ui.log("Image address types (private parts hidden):")
     for shape, c in sorted(per_shape.items(), key=lambda kv: -sum(kv[1].values()))[:6]:
         ui.log(f"  {sum(c.values())} x {shape}: {c['address']} matched by address, "
@@ -618,12 +692,17 @@ async def session(ui, ctx, out_dir, index):
 
 
 async def run(ui, out_dir):
+    t_run = time.monotonic()
+    TIMING.clear()
     ui.banner()
     out_dir.mkdir(parents=True, exist_ok=True)
     PROFILES.mkdir(exist_ok=True)
+    runlog.start(out_dir)
 
     index = ImageIndex(out_dir)
+    t_index = time.monotonic()
     index.load(ui)
+    TIMING["Checking existing images"] += time.monotonic() - t_index
     ui.progress(0, 1)
 
     try:
@@ -653,7 +732,13 @@ async def run(ui, out_dir):
         if result["failed"]:
             ui.log(f"  Failed:                       {result['failed']}  (run it again to retry these)")
         ui.log(f"Your images are in: {out_dir}")
-        ui.status("Done.")
+        took = time.monotonic() - t_run
+        ui.log(f"Time taken: {fmt_dur(took)}")
+        for name in ("Checking existing images", "Opening Gemini", "Waiting for you",
+                     "Scanning your Library", "Saving images"):
+            if TIMING[name] >= 1:
+                ui.log(f"   {name + ':':<28}{fmt_dur(TIMING[name])}")
+        ui.status(f"Done in {fmt_dur(took)}.")
         try:
             os.startfile(out_dir)    # open the folder (Windows)
         except Exception:
@@ -682,10 +767,15 @@ def report_crash(ui):
 
 class ConsoleUI:
     def banner(self): console_banner()
-    def log(self, msg): print(msg)
+    def log(self, msg):
+        line = stamped(msg)
+        runlog.write(line)
+        print(line)
     def status(self, text): pass
     def progress(self, done, total): pass
-    def alert(self, msg): print("\n" + msg)
+    def alert(self, msg):
+        print("\n" + msg)
+        runlog.write(stamped(msg))
     def check(self): pass
 
     def ask(self, msg):
@@ -753,6 +843,8 @@ class App:
         self.ask_event = None
         self.thread = None
         self.bar_indeterminate = False
+        self.run_started = None
+        self.run_done = True
 
         root = self.root = ctk.CTk()
         root.title(f"Gemini Image Downloader v{VERSION}")
@@ -809,6 +901,10 @@ class App:
                       command=self.open_folder, fg_color="transparent", border_width=1,
                       border_color=BORDER, text_color=TEXT, hover_color=SUBTLE_HOVER,
                       font=font(13)).pack(side="left")
+        ctk.CTkButton(row, text="Open log", width=96, height=40, corner_radius=10,
+                      command=self.open_log, fg_color="transparent", border_width=1,
+                      border_color=BORDER, text_color=TEXT, hover_color=SUBTLE_HOVER,
+                      font=font(13)).pack(side="left", padx=(10, 0))
 
         # ---- notice box (shown only when you need to do something in the browser) ----
         self.prompt_frame = ctk.CTkFrame(root, corner_radius=12, fg_color=NOTICE_BG,
@@ -830,9 +926,12 @@ class App:
         self.status_var = ctk.StringVar(value="Ready. Click Start download.")
         ctk.CTkLabel(status, textvariable=self.status_var, font=font(13), text_color=TEXT,
                      anchor="w").grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.elapsed_var = ctk.StringVar(value="")
+        ctk.CTkLabel(status, textvariable=self.elapsed_var, font=font(13), text_color=MUTED,
+                     anchor="e").grid(row=0, column=1, sticky="e", padx=(12, 0), pady=(0, 6))
         self.bar = ctk.CTkProgressBar(status, height=10, corner_radius=5, progress_color=ACCENT)
         self.bar.set(0)
-        self.bar.grid(row=1, column=0, sticky="ew")
+        self.bar.grid(row=1, column=0, columnspan=2, sticky="ew")
 
         # ---- log ----
         self.log_box = ctk.CTkTextbox(root, corner_radius=12, font=("Consolas", 12), wrap="word")
@@ -887,10 +986,16 @@ class App:
 
     # ----- calls made by the worker thread (thread-safe via the queue) -----
     def banner(self): pass
-    def log(self, msg): self.q.put(("log", msg))
+    def log(self, msg):
+        line = stamped(msg)
+        runlog.write(line)
+        self.q.put(("log", line))
     def status(self, text): self.q.put(("status", text))
     def progress(self, done, total): self.q.put(("progress", done, total))
-    def alert(self, msg): self.q.put(("alert", msg))
+    def alert(self, msg):
+        line = stamped(msg)
+        runlog.write(line)
+        self.q.put(("alert", msg, line))
 
     def check(self):
         if self.cancelled:
@@ -940,6 +1045,8 @@ class App:
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.status_var.set("Starting...")
+        self.run_started, self.run_done = time.monotonic(), False
+        self.elapsed_var.set("Elapsed 0:00")
         self.thread = threading.Thread(target=self.work, args=(out,), daemon=True)
         self.thread.start()
 
@@ -993,6 +1100,8 @@ class App:
         self.log_box.configure(state="disabled")
 
     def poll(self):
+        if self.run_started is not None and not self.run_done:
+            self.elapsed_var.set("Elapsed " + fmt_clock(time.monotonic() - self.run_started))
         try:
             while True:
                 item = self.q.get_nowait()
@@ -1009,7 +1118,7 @@ class App:
                     self.prompt_frame.grid()
                     self.root.bell()
                 elif kind == "alert":
-                    self.append_log(item[1])
+                    self.append_log(item[2])
                     self.dialog("Gemini Image Downloader", item[1])
                 elif kind == "finished":
                     self.finished()
@@ -1030,7 +1139,16 @@ class App:
                 self.bar_indeterminate = False
             self.bar.set(done / max(total, 1))
 
+    def open_log(self):
+        try:
+            os.startfile(runlog.path)
+        except Exception:
+            self.dialog("No log yet", "The log file is created when you start a download.")
+
     def finished(self):
+        if self.run_started is not None and not self.run_done:
+            self.elapsed_var.set("Took " + fmt_clock(time.monotonic() - self.run_started))
+        self.run_done = True
         if self.bar_indeterminate:
             self.bar.stop()
             self.bar.configure(mode="determinate")

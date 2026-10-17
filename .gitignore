@@ -14,4 +14,5 @@ gemini_images/
 browser_profile/
 settings.json
 error_log.txt
+last_run_log.txt
 no_images_found.png
