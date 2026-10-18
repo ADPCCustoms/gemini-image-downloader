@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.2.7"
+VERSION = "1.2.8"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -200,7 +200,7 @@ def qualifies(im):
         return False
     if im["w"] >= MIN_SIZE and im["h"] >= MIN_SIZE:
         return True
-    return is_library_url(src) and im["w"] >= 40 and im["h"] >= 40
+    return is_library_url(src) and im["w"] >= 16 and im["h"] >= 16
 
 
 def is_ui_image(src):
@@ -265,11 +265,34 @@ async def scroll_everything_down(page, rescan=True):
     }""", rescan)
 
 
+PREVIEW_SIZE_RE = re.compile(r"=(w\d+-h\d+|s\d+)")
+
+
+def preview_url(url, size=128):
+    """The same picture address, asking for a small preview instead of the full-size picture."""
+    def small(m):
+        return f"=w{size}-h{size}" if m.group(1).startswith("w") else f"=s{size}"
+    return PREVIEW_SIZE_RE.sub(small, url, count=1)
+
+
 async def block_library_images(page):
-    """Stop the page downloading the Library pictures themselves while we scroll: the scan only
-    needs their addresses, and loading thousands of full pictures was most of the scan time."""
+    """While scrolling, make the page ask for small previews of the Library pictures instead of
+    full-size ones. The scan only needs their addresses, and loading thousands of full-size
+    pictures was most of the scan time. (The pictures still load, so the page behaves normally;
+    simply blocking them stopped it from listing more than the first few.)"""
     async def handler(route):
-        await route.abort()
+        try:
+            url = route.request.url
+            small = preview_url(url)
+            if small != url:
+                await route.continue_(url=small)
+            else:
+                await route.continue_()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
     try:
         await page.route(LIBRARY_URL_RE, handler)
         return handler
@@ -368,6 +391,8 @@ class ImageIndex:
         self.dirty = False
         self.library_total = 0   # how many Library images the last complete run found
         self.last_short = 0      # count found by the last run that ended short of the expected size
+        self.fast_failures = 0   # runs in a row where the fast (preview-size) scan came up short
+        self.fast_failed_version = ""   # tool version those failures happened with
 
     def _register(self, name, rec):
         self.files[name] = rec
@@ -384,6 +409,10 @@ class ImageIndex:
             old_files, old_urls = data.get("files", {}), data.get("urls", {})
             self.library_total = int(data.get("library_total", 0))
             self.last_short = int(data.get("last_short", 0))
+            self.fast_failures = int(data.get("fast_failures", 0))
+            self.fast_failed_version = str(data.get("fast_failed_version", ""))
+            if self.fast_failed_version != VERSION:
+                self.fast_failures = 0          # a new version of the tool gets to try the fast scan again
         except Exception:
             old_files, old_urls = {}, {}
 
@@ -477,7 +506,9 @@ class ImageIndex:
         try:
             self.path.write_text(json.dumps({"files": self.files, "urls": self.urls,
                                                  "library_total": self.library_total,
-                                                 "last_short": self.last_short}), encoding="utf-8")
+                                                 "last_short": self.last_short,
+                                                 "fast_failures": self.fast_failures,
+                                                 "fast_failed_version": self.fast_failed_version}), encoding="utf-8")
             self.dirty = False
         except Exception:
             pass
@@ -672,9 +703,14 @@ async def session(ui, ctx, out_dir, index):
     expected = index.expected_library_size()
     best = {}
     blocker = None
-    if expected:        # we have a size to check the result against, so scan without loading every picture
+    fast_tried = False
+    if expected and index.fast_failures >= 2:
+        ui.log("Using the careful full-size scan (the faster preview scan didn't work on the last runs).")
+    elif expected:      # we have a size to check the result against, so scan using small previews
         blocker = await block_library_images(page)
-        ui.log("Scanning the Library without loading every picture (faster)...")
+        fast_tried = blocker is not None
+        if fast_tried:
+            ui.log("Scanning the Library using small previews (faster)...")
     candidates = await collect_images(ui, page, expected, best)
     counts = [count_distinct(best)]
     for attempt in (1, 2):
@@ -699,6 +735,13 @@ async def session(ui, ctx, out_dir, index):
     if blocker:
         await unblock_library_images(page, blocker)
     TIMING["Scanning your Library"] += (time.monotonic() - t_scan) - (TIMING["Waiting for you"] - w_scan)
+    if fast_tried:
+        if counts[0] >= 0.95 * expected:
+            index.fast_failures = 0
+        else:
+            index.fast_failures += 1
+            index.fast_failed_version = VERSION
+        index.dirty = True
     found = counts[-1]
     if expected and found < 0.95 * expected:
         ui.log(f"Only {found} images found (expected about {expected}). If you haven't deleted images "
