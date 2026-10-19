@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.2.8"
+VERSION = "1.3.0"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -329,12 +329,32 @@ INDEX_NAME = ".gemini_index.json"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 NAME_KEY_RE = re.compile(r"^gemini_([0-9a-f]{16})\.")
 CONCURRENCY = 6          # images downloaded at the same time
+TAIL_BYTES = 32768       # how much of the END of a file identifies a picture (see fetch_tail)
+TAIL_VERIFY_EVERY = 50   # spot-check every 50th end-of-file match against the full picture
 
 
 def image_key(src):
     """Stable name for an image so re-runs can skip ones already saved."""
     full = re.sub(r"=[sw]\d+.*$", "=s0", src)
     return hashlib.md5(full.encode()).hexdigest()[:16], full
+
+
+def file_tail_hash(path, n=None):
+    """Fingerprint of the last `n` bytes of a file. Two downloads of the same picture differ only in a
+    few bytes of metadata near the start, so their ends are identical."""
+    n = n or TAIL_BYTES
+    with open(path, "rb") as f:
+        size = f.seek(0, 2)
+        f.seek(max(0, size - n))
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+CTYPE_EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
+
+
+def norm_ext(ext):
+    ext = ext.lower().lstrip(".")
+    return "jpg" if ext == "jpeg" else ext
 
 
 def sha256_bytes(data):
@@ -393,12 +413,18 @@ class ImageIndex:
         self.last_short = 0      # count found by the last run that ended short of the expected size
         self.fast_failures = 0   # runs in a row where the fast (preview-size) scan came up short
         self.fast_failed_version = ""   # tool version those failures happened with
+        self.tails = defaultdict(list)  # fingerprint of a file's end -> [file names]
+        self.tail_enabled = True
+        self.tail_ready = False         # True when the folder already held pictures at the start of the run
+        self.tail_off_version = ""      # tool version in which an end-of-file match was found to be wrong
 
     def _register(self, name, rec):
         self.files[name] = rec
         self.hashes.setdefault(rec["hash"], name)
         if rec.get("pix"):
             self.pix.setdefault(rec["pix"], name)
+        if rec.get("tail"):
+            self.tails[rec["tail"]].append(name)
         if rec.get("dh"):
             ext = Path(name).suffix.lower().lstrip(".")
             self.near[(rec["w"], rec["h"], ext)].append((int(rec["dh"], 16), rec["size"], name))
@@ -413,6 +439,8 @@ class ImageIndex:
             self.fast_failed_version = str(data.get("fast_failed_version", ""))
             if self.fast_failed_version != VERSION:
                 self.fast_failures = 0          # a new version of the tool gets to try the fast scan again
+            self.tail_off_version = str(data.get("tail_off_version", ""))
+            self.tail_enabled = self.tail_off_version != VERSION
         except Exception:
             old_files, old_urls = {}, {}
 
@@ -452,6 +480,14 @@ class ImageIndex:
                 ex.shutdown(wait=False, cancel_futures=True)
             self.dirty = True
 
+        for p in names:                          # fingerprint of each file's end (quick: reads only the end)
+            rec = recs[p.name]
+            if "tail" not in rec:
+                try:
+                    rec["tail"] = file_tail_hash(p)
+                except Exception:
+                    rec["tail"] = ""
+                self.dirty = True
         for name, rec in recs.items():
             self._register(name, rec)
         if set(recs) != set(old_files):
@@ -462,6 +498,7 @@ class ImageIndex:
             if m:
                 self.urls[m.group(1)] = rec["hash"]
         self.urls = {k: v for k, v in self.urls.items() if v in self.hashes}
+        self.tail_ready = bool(self.tails)
         if total:
             ui.log(f"{total} images are already in this folder.")
 
@@ -485,15 +522,23 @@ class ImageIndex:
                 return name
         return None
 
+    def find_tail(self, h, total, ext):
+        """An existing file whose last bytes are identical, with the same type and almost the same size."""
+        for name in self.tails.get(h, ()):
+            if abs(self.files[name]["size"] - total) <= 16 and norm_ext(Path(name).suffix) == ext:
+                return name
+        return None
+
     def alias(self, key, name):
         h = self.files[name]["hash"]
         if self.urls.get(key) != h:
             self.urls[key] = h
             self.dirty = True
 
-    def add(self, key, h, path, fp):
+    def add(self, key, h, path, fp, body=None):
         st = path.stat()
         rec = {"size": st.st_size, "mtime": int(st.st_mtime), "hash": h,
+               "tail": sha256_bytes(body[-TAIL_BYTES:]) if body else file_tail_hash(path),
                "pix": fp[0] if fp else "", "dh": format(fp[1], "x") if fp else "",
                "w": fp[2] if fp else 0, "h": fp[3] if fp else 0}
         self._register(path.name, rec)
@@ -508,7 +553,8 @@ class ImageIndex:
                                                  "library_total": self.library_total,
                                                  "last_short": self.last_short,
                                                  "fast_failures": self.fast_failures,
-                                                 "fast_failed_version": self.fast_failed_version}), encoding="utf-8")
+                                                 "fast_failed_version": self.fast_failed_version,
+                                                 "tail_off_version": self.tail_off_version}), encoding="utf-8")
             self.dirty = False
         except Exception:
             pass
@@ -544,13 +590,70 @@ async def fetch_image(page, ctx, src, full):
     raise RuntimeError(f"download failed ({last})")
 
 
-async def save_image(page, ctx, src, out_dir, index, lock):
-    """Returns ('skipped', 'address' | 'content') or ('saved', 'new')."""
+async def fetch_tail(ctx, full):
+    """Ask the server for just the last TAIL_BYTES of the file (much less data than the whole picture).
+    Returns ('tail', bytes, total file size, content type), or ('full', bytes, size, type) if the server
+    ignored the request and sent everything, or None."""
+    try:
+        r = await ctx.request.get(full, headers={"Range": f"bytes=-{TAIL_BYTES}"})
+    except Exception:
+        return None
+    ctype = r.headers.get("content-type", "")
+    if r.status == 206:
+        m = re.search(r"/(\d+)\s*$", r.headers.get("content-range", ""))
+        if not m:
+            return None
+        body = await r.body()
+        COUNTS["tail_bytes"] += len(body)
+        return "tail", body, int(m.group(1)), ctype
+    if r.status == 200:
+        body = await r.body()
+        COUNTS["downloads"] += 1
+        COUNTS["bytes"] += len(body)
+        return "full", body, len(body), ctype
+    return None
+
+
+async def save_image(page, ctx, src, out_dir, index, lock, ui=None):
+    """Returns ('skipped', 'address' | 'tail' | 'content') or ('saved', 'new')."""
     key, full = image_key(src)
     if index.has_url(key):
         return "skipped", "address"           # quick check by web address
 
-    body, ctype = await fetch_image(page, ctx, src, full)
+    body = ctype = None
+    if index.tail_enabled and index.tail_ready and Image is not None \
+            and not src.startswith(("blob:", "data:")):
+        got = await fetch_tail(ctx, full)     # try to recognise it from the end of the file alone
+        if got and got[0] == "full":
+            _, body, _, ctype = got
+        elif got:
+            _, data, total, ctype = got
+            COUNTS["tail_tried"] += 1
+            kind_ext = CTYPE_EXT.get(ctype.split(";")[0].strip())
+            COUNTS[f"tried_{kind_ext}"] += 1
+            name = index.find_tail(sha256_bytes(data), total, kind_ext)
+            if name:
+                COUNTS[f"matched_{kind_ext}"] += 1
+                if int(key, 16) % TAIL_VERIFY_EVERY:
+                    index.alias(key, name)
+                    COUNTS["tail_hits"] += 1
+                    return "skipped", "tail"
+                # spot check: fetch the whole picture and make sure it really is the same picture
+                body, ctype = await fetch_image(page, ctx, src, full)
+                fp = await asyncio.get_running_loop().run_in_executor(None, pixel_fingerprint, body)
+                if fp and fp[0] == index.files[name].get("pix"):
+                    index.alias(key, name)
+                    COUNTS["tail_verified"] += 1
+                    return "skipped", "tail"
+                COUNTS["tail_mismatch"] += 1          # an end-of-file match was wrong: stop using it
+                index.tail_enabled = False
+                index.tail_off_version = VERSION
+                index.dirty = True
+                if ui:
+                    ui.log("  Warning: a picture recognised from its file end turned out to be different. "
+                           "That shortcut is switched off; every picture will be checked in full.")
+    if body is None:
+        body, ctype = await fetch_image(page, ctx, src, full)
     h = sha256_bytes(body)
     ext = {"image/jpeg": "jpg", "image/webp": "webp"}.get(ctype)
     if not ext:
@@ -566,7 +669,7 @@ async def save_image(page, ctx, src, out_dir, index, lock):
             return "skipped", "content"
         path = out_dir / f"gemini_{key}.{ext}"
         path.write_bytes(body)
-        index.add(key, h, path, fp)
+        index.add(key, h, path, fp, body)
         return "saved", "new"
 
 
@@ -780,7 +883,7 @@ async def session(ui, ctx, out_dir, index):
         async with sem:
             ui.check()
             try:
-                return src, await save_image(page, ctx, src, out_dir, index, lock), None
+                return src, await save_image(page, ctx, src, out_dir, index, lock, ui), None
             except Cancelled:
                 raise
             except Exception as e:
@@ -809,7 +912,7 @@ async def session(ui, ctx, out_dir, index):
             ui.status(f"Saving images... {n}/{total}{eta}")
             if n % 50 == 0 or n == total:
                 ui.log(f"  {n}/{total} done ({stats['new']} new, "
-                       f"{stats['address'] + stats['content']} already in folder, {stats['failed']} failed)")
+                       f"{stats['address'] + stats['tail'] + stats['content']} already in folder, {stats['failed']} failed)")
     except BaseException:
         for t in tasks:
             t.cancel()
@@ -819,10 +922,10 @@ async def session(ui, ctx, out_dir, index):
     TIMING["Saving images"] += time.monotonic() - t_save
     ui.log("Image address types (private parts hidden):")
     for shape, c in sorted(per_shape.items(), key=lambda kv: -sum(kv[1].values()))[:6]:
-        ui.log(f"  {sum(c.values())} x {shape}: {c['address']} matched by address, "
+        ui.log(f"  {sum(c.values())} x {shape}: {c['address']} matched by address, {c['tail']} by file end, "
                f"{c['content']} by picture, {c['new']} new")
-    return {"saved": stats["new"], "skipped": stats["address"] + stats["content"],
-            "by_address": stats["address"], "by_content": stats["content"],
+    return {"saved": stats["new"], "skipped": stats["address"] + stats["tail"] + stats["content"],
+            "by_address": stats["address"], "by_tail": stats["tail"], "by_content": stats["content"],
             "failed": stats["failed"], "total": total}
 
 
@@ -864,7 +967,8 @@ async def run(ui, out_dir):
         ui.log(f"  Images in your Library:       {result['total']}")
         ui.log(f"  New images saved:             {result['saved']}")
         ui.log(f"  Already in your folder:       {result['skipped']}  "
-               f"({result['by_address']} by address, {result['by_content']} by picture)")
+               f"({result['by_address']} by address, {result['by_tail']} by file end, "
+               f"{result['by_content']} by picture)")
         if result["failed"]:
             ui.log(f"  Failed:                       {result['failed']}  (run it again to retry these)")
         ui.log(f"Your images are in: {out_dir}")
@@ -878,6 +982,16 @@ async def run(ui, out_dir):
             mb = COUNTS["bytes"] / 1e6
             ui.log(f"   Downloaded {COUNTS['downloads']} images ({mb:,.0f} MB, "
                    f"{mb / TIMING['Saving images']:.1f} MB/s while saving)")
+        if COUNTS["tail_tried"]:
+            recognised = COUNTS["tail_hits"] + COUNTS["tail_verified"]
+            ui.log(f"   Checked {COUNTS['tail_tried']} pictures from just their file end "
+                   f"({COUNTS['tail_bytes'] / 1e6:,.0f} MB fetched): {recognised} recognised, "
+                   f"{COUNTS['tail_verified']} spot-checked against the full picture, "
+                   f"{COUNTS['tail_mismatch']} mismatches")
+            by_type = ", ".join(f"{k} {COUNTS['matched_' + k]}/{COUNTS['tried_' + k]}"
+                                for k in ("png", "jpg", "webp") if COUNTS["tried_" + k])
+            if by_type:
+                ui.log(f"   File-end matches by picture type: {by_type}")
         ui.status(f"Done in {fmt_dur(took)}.")
         try:
             os.startfile(out_dir)    # open the folder (Windows)
