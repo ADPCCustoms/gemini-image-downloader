@@ -12,7 +12,7 @@ Gemini's web page layout, so it may stop working if Google changes the site.
 Options:  --cli    run in the console instead of the window
           --debug  extra diagnostic output
 """
-import asyncio, base64, hashlib, io, json, os, queue, re, sys, threading, time, traceback
+import asyncio, base64, contextlib, hashlib, io, json, os, queue, re, sys, threading, time, traceback
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -328,7 +328,9 @@ async def settle(page, min_ms, max_ms):
 INDEX_NAME = ".gemini_index.json"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 NAME_KEY_RE = re.compile(r"^gemini_([0-9a-f]{16})\.")
-CONCURRENCY = 6          # images downloaded at the same time
+CONCURRENCY = 6          # full-size pictures downloaded at the same time (limited by bandwidth)
+LOOKUP_CONCURRENCY = 24  # pictures checked at the same time (small requests, limited by round-trip time)
+FULL_LIMIT = None        # set per run: caps simultaneous full-size downloads
 TAIL_BYTES = 32768       # how much of the END of a file identifies a picture (see fetch_tail)
 TAIL_VERIFY_EVERY = 50   # spot-check every 50th end-of-file match against the full picture
 
@@ -573,19 +575,20 @@ async def fetch_image(page, ctx, src, full):
         return base64.b64decode(b64), ""
     last = "no response"
     for attempt in range(3):
-        try:
-            r = await ctx.request.get(full)
-        except Exception as e:                 # network hiccup
-            last = str(e)
-        else:
-            if r.ok:
-                body = await r.body()
-                COUNTS["downloads"] += 1
-                COUNTS["bytes"] += len(body)
-                return body, r.headers.get("content-type", "")
-            last = f"HTTP {r.status}"
-            if r.status not in (403, 408, 429) and r.status < 500:
-                break                          # not worth retrying (e.g. 404)
+        async with (FULL_LIMIT or contextlib.nullcontext()):
+            try:
+                r = await ctx.request.get(full)
+            except Exception as e:                 # network hiccup
+                last = str(e)
+            else:
+                if r.ok:
+                    body = await r.body()
+                    COUNTS["downloads"] += 1
+                    COUNTS["bytes"] += len(body)
+                    return body, r.headers.get("content-type", "")
+                last = f"HTTP {r.status}"
+                if r.status not in (403, 408, 429) and r.status < 500:
+                    break                          # not worth retrying (e.g. 404)
         await asyncio.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"download failed ({last})")
 
@@ -594,23 +597,28 @@ async def fetch_tail(ctx, full):
     """Ask the server for just the last TAIL_BYTES of the file (much less data than the whole picture).
     Returns ('tail', bytes, total file size, content type), or ('full', bytes, size, type) if the server
     ignored the request and sent everything, or None."""
-    try:
-        r = await ctx.request.get(full, headers={"Range": f"bytes=-{TAIL_BYTES}"})
-    except Exception:
-        return None
-    ctype = r.headers.get("content-type", "")
-    if r.status == 206:
-        m = re.search(r"/(\d+)\s*$", r.headers.get("content-range", ""))
-        if not m:
-            return None
-        body = await r.body()
-        COUNTS["tail_bytes"] += len(body)
-        return "tail", body, int(m.group(1)), ctype
-    if r.status == 200:
-        body = await r.body()
-        COUNTS["downloads"] += 1
-        COUNTS["bytes"] += len(body)
-        return "full", body, len(body), ctype
+    for attempt in range(3):
+        try:
+            r = await ctx.request.get(full, headers={"Range": f"bytes=-{TAIL_BYTES}"})
+        except Exception:
+            r = None
+        if r is not None:
+            ctype = r.headers.get("content-type", "")
+            if r.status == 206:
+                m = re.search(r"/(\d+)\s*$", r.headers.get("content-range", ""))
+                if not m:
+                    return None
+                body = await r.body()
+                COUNTS["tail_bytes"] += len(body)
+                return "tail", body, int(m.group(1)), ctype
+            if r.status == 200:
+                body = await r.body()
+                COUNTS["downloads"] += 1
+                COUNTS["bytes"] += len(body)
+                return "full", body, len(body), ctype
+            if r.status not in (403, 408, 429) and r.status < 500:
+                return None                     # e.g. 404 or 416: not worth retrying
+        await asyncio.sleep(1.0 * (attempt + 1))
     return None
 
 
@@ -877,7 +885,9 @@ async def session(ui, ctx, out_dir, index):
     ui.log(f"Found {total} images in your Library. Saving new ones to: {out_dir}")
     stats = Counter()
     per_shape = defaultdict(Counter)
-    lock, sem = asyncio.Lock(), asyncio.Semaphore(CONCURRENCY)
+    global FULL_LIMIT
+    FULL_LIMIT = asyncio.Semaphore(CONCURRENCY)
+    lock, sem = asyncio.Lock(), asyncio.Semaphore(LOOKUP_CONCURRENCY)
 
     async def work(src):
         async with sem:
