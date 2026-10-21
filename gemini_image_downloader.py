@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -46,6 +46,7 @@ BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__
 DEFAULT_OUT = BASE / "gemini_images"
 PROFILES = BASE / "browser_profile"      # keeps you logged in between runs
 QUICK_LISTING = "--no-quick-listing" not in sys.argv   # try jumping straight to the bottom of the Library first
+PREVIEW_SCAN = "--preview-scan" in sys.argv   # ask for small previews while scanning (measured: no real speed-up)
 
 BROWSERS = [("chrome", "Google Chrome"), ("msedge", "Microsoft Edge")]
 
@@ -788,6 +789,8 @@ async def collect_images(ui, page, expected=0, best=None, passes=3, careful=Fals
             break
         if expected and total == expected:
             break                    # exactly what we expected: no need for a second look
+        if expected and total < 0.95 * expected:
+            break                    # far short: the page has stalled, a second pass won't help
         previous = total
 
     by_key = {}
@@ -842,42 +845,18 @@ async def session(ui, ctx, out_dir, index):
     best = {}
     blocker = None
     fast_tried = False
-    if expected and index.fast_failures >= 2:
-        ui.log("Using the careful full-size scan (the faster preview scan didn't work on the last runs).")
-    elif expected:      # we have a size to check the result against, so scan using small previews
-        blocker = await block_library_images(page)
+    if PREVIEW_SCAN and expected and index.fast_failures < 2:
+        blocker = await block_library_images(page)     # we have a size to check the result against
         fast_tried = blocker is not None
         if fast_tried:
             ui.log("Scanning the Library using small previews (faster)...")
-    candidates = None
-    if QUICK_LISTING and expected and index.jump_failures < 2:
-        ui.log("Trying a quicker way to list the Library (jumping to the bottom to load it all)...")
-        candidates = await collect_images(ui, page, expected, best, jump=True)
-        if count_distinct(best) >= 0.99 * expected:
-            index.jump_failures = 0
-        else:
-            index.jump_failures += 1
-            index.jump_failed_version = VERSION
-            ui.log(f"  The quick listing found only {count_distinct(best)} of about {expected}, "
-                   "so listing the Library the careful way...")
-            candidates = None
-            await scroll_to_top(page)
-            await page.wait_for_timeout(1500)
-        index.dirty = True
-    elif QUICK_LISTING and expected:
-        ui.log("Listing the Library the careful way (the quick way didn't work on the last runs).")
-    if candidates is None:
-        candidates = await collect_images(ui, page, expected, best)
-    counts = [count_distinct(best)]
-    for attempt in (1, 2):
-        if not expected or counts[-1] >= 0.95 * expected:
-            break
-        if len(counts) > 1 and counts[-1] == counts[-2]:
-            break                                  # the last reload found nothing new
-        ui.log(f"Found {counts[-1]} images but expected about {expected}. Gemini may not have "
-               f"finished loading, so reloading the Library to look again carefully ({attempt} of 2)...")
+    elif PREVIEW_SCAN and expected:
+        ui.log("Using the careful full-size scan (the faster preview scan didn't work on the last runs).")
+
+    async def reload_library():
+        nonlocal blocker
         if blocker:
-            await unblock_library_images(page, blocker)    # retry the slow, careful way
+            await unblock_library_images(page, blocker)    # retry the careful way
             blocker = None
         await safe_goto(page, GEMINI_URL)
         await page.wait_for_timeout(5000)
@@ -885,6 +864,48 @@ async def session(ui, ctx, out_dir, index):
             await ask(ui, f"Couldn't find '{SECTION}' in the Gemini sidebar. Click '{SECTION}' in the "
                           "browser window, then continue.")
         await page.wait_for_timeout(6000)
+
+    candidates = None
+    use_quick = QUICK_LISTING and expected and index.jump_failures < 2
+    quick_ok = False
+    if use_quick:
+        ui.log("Trying a quicker way to list the Library (jumping to the bottom to load it all)...")
+        candidates = await collect_images(ui, page, expected, best, jump=True)
+        quick_ok = count_distinct(best) >= 0.99 * expected
+        if not quick_ok:
+            # Gemini often loads only the first ~600 pictures the first time; a reload fixes that
+            ui.log(f"  The quick listing found only {count_distinct(best)} of about {expected}. Gemini may not "
+                   "have finished loading, so reloading the Library and trying again...")
+            await reload_library()
+            candidates = await collect_images(ui, page, expected, best, jump=True)
+            quick_ok = count_distinct(best) >= 0.99 * expected
+            if not quick_ok:
+                ui.log(f"  The quick listing found {count_distinct(best)} of about {expected}, "
+                       "so listing the Library the careful way...")
+                candidates = None
+                await scroll_to_top(page)
+                await page.wait_for_timeout(1500)
+        if quick_ok:
+            index.jump_failures = 0
+            index.dirty = True
+    elif QUICK_LISTING and expected:
+        ui.log("Listing the Library the careful way (the quick way didn't work on the last runs).")
+    if candidates is None:
+        candidates = await collect_images(ui, page, expected, best)
+    counts = [count_distinct(best)]
+    if use_quick and not quick_ok and counts[0] >= 0.95 * expected:
+        # the page was healthy (the careful way found everything) but the quick way still failed
+        index.jump_failures += 1
+        index.jump_failed_version = VERSION
+        index.dirty = True
+    for attempt in (1, 2):
+        if not expected or counts[-1] >= 0.95 * expected:
+            break
+        if len(counts) > 1 and counts[-1] == counts[-2]:
+            break                                  # the last reload found nothing new
+        ui.log(f"Found {counts[-1]} images but expected about {expected}. Gemini may not have "
+               f"finished loading, so reloading the Library to look again carefully ({attempt} of 2)...")
+        await reload_library()
         candidates = await collect_images(ui, page, expected, best, passes=1, careful=True)
         counts.append(count_distinct(best))
 
