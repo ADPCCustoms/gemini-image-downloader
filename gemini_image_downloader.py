@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -45,6 +45,7 @@ GEMINI_URL = "https://gemini.google.com/app"
 BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DEFAULT_OUT = BASE / "gemini_images"
 PROFILES = BASE / "browser_profile"      # keeps you logged in between runs
+QUICK_LISTING = "--no-quick-listing" not in sys.argv   # try jumping straight to the bottom of the Library first
 
 BROWSERS = [("chrome", "Google Chrome"), ("msedge", "Microsoft Edge")]
 
@@ -244,10 +245,11 @@ async def click_section(page, name):
     return False
 
 
-async def scroll_everything_down(page, rescan=True):
-    """Scroll every scrollable element down a bit; return how far anything moved.
-    The scrollable elements are remembered between steps (rescan=True looks for them again)."""
-    return await page.evaluate("""(rescan) => {
+async def scroll_everything_down(page, rescan=True, jump=False):
+    """Scroll every scrollable element down a bit (or, with jump=True, straight to its bottom) and
+    return how far anything moved. The scrollable elements are remembered between steps
+    (rescan=True looks for them again)."""
+    return await page.evaluate("""([rescan, jump]) => {
         let els = window.__gemScrollers;
         if (!els || rescan) {
             els = [document.scrollingElement, ...document.querySelectorAll('*')]
@@ -258,11 +260,11 @@ async def scroll_everything_down(page, rescan=True):
         for (const el of els) {
             if (!el.isConnected) continue;
             const before = el.scrollTop;
-            el.scrollTop = before + el.clientHeight * 0.9;
+            el.scrollTop = jump ? el.scrollHeight : before + el.clientHeight * 0.9;
             moved += el.scrollTop - before;
         }
         return moved;
-    }""", rescan)
+    }""", [rescan, jump])
 
 
 PREVIEW_SIZE_RE = re.compile(r"=(w\d+-h\d+|s\d+)")
@@ -416,6 +418,9 @@ class ImageIndex:
         self.fast_failures = 0   # runs in a row where the fast (preview-size) scan came up short
         self.fast_failed_version = ""   # tool version those failures happened with
         self.tails = defaultdict(list)  # fingerprint of a file's end -> [file names]
+        self.jump_failures = 0          # runs in a row where the quick listing came up short
+        self.jump_failed_version = ""
+        self.claims = {}                # file name -> the Library entry that matched it first (this run)
         self.tail_enabled = True
         self.tail_ready = False         # True when the folder already held pictures at the start of the run
         self.tail_off_version = ""      # tool version in which an end-of-file match was found to be wrong
@@ -441,6 +446,10 @@ class ImageIndex:
             self.fast_failed_version = str(data.get("fast_failed_version", ""))
             if self.fast_failed_version != VERSION:
                 self.fast_failures = 0          # a new version of the tool gets to try the fast scan again
+            self.jump_failures = int(data.get("jump_failures", 0))
+            self.jump_failed_version = str(data.get("jump_failed_version", ""))
+            if self.jump_failed_version != VERSION:
+                self.jump_failures = 0          # a new version gets to try the quick listing again
             self.tail_off_version = str(data.get("tail_off_version", ""))
             self.tail_enabled = self.tail_off_version != VERSION
         except Exception:
@@ -531,6 +540,12 @@ class ImageIndex:
                 return name
         return None
 
+    def claim(self, name, key):
+        """Note that Library entry `key` matched file `name`. Returns the entry that matched it first,
+        if that was a different one (two Library entries for what looks like the same picture)."""
+        first = self.claims.setdefault(name, key)
+        return first if first != key else None
+
     def alias(self, key, name):
         h = self.files[name]["hash"]
         if self.urls.get(key) != h:
@@ -556,7 +571,9 @@ class ImageIndex:
                                                  "last_short": self.last_short,
                                                  "fast_failures": self.fast_failures,
                                                  "fast_failed_version": self.fast_failed_version,
-                                                 "tail_off_version": self.tail_off_version}), encoding="utf-8")
+                                                 "tail_off_version": self.tail_off_version,
+                                                 "jump_failures": self.jump_failures,
+                                                 "jump_failed_version": self.jump_failed_version}), encoding="utf-8")
             self.dirty = False
         except Exception:
             pass
@@ -626,6 +643,9 @@ async def save_image(page, ctx, src, out_dir, index, lock, ui=None):
     """Returns ('skipped', 'address' | 'tail' | 'content') or ('saved', 'new')."""
     key, full = image_key(src)
     if index.has_url(key):
+        name = index.hashes.get(index.urls[key])
+        if name:
+            index.claim(name, key)
         return "skipped", "address"           # quick check by web address
 
     body = ctype = None
@@ -642,16 +662,21 @@ async def save_image(page, ctx, src, out_dir, index, lock, ui=None):
             name = index.find_tail(sha256_bytes(data), total, kind_ext)
             if name:
                 COUNTS[f"matched_{kind_ext}"] += 1
-                if int(key, 16) % TAIL_VERIFY_EVERY:
+                shared = index.claim(name, key) is not None     # another entry already matched this same file
+                if shared:
+                    COUNTS["tail_shared"] += 1
+                if not shared and int(key, 16) % TAIL_VERIFY_EVERY:
                     index.alias(key, name)
                     COUNTS["tail_hits"] += 1
                     return "skipped", "tail"
-                # spot check: fetch the whole picture and make sure it really is the same picture
+                # check in full: spot checks, and every picture that shares a file with another entry
                 body, ctype = await fetch_image(page, ctx, src, full)
                 fp = await asyncio.get_running_loop().run_in_executor(None, pixel_fingerprint, body)
                 if fp and fp[0] == index.files[name].get("pix"):
                     index.alias(key, name)
                     COUNTS["tail_verified"] += 1
+                    if shared:
+                        COUNTS["tail_shared_same"] += 1
                     return "skipped", "tail"
                 COUNTS["tail_mismatch"] += 1          # an end-of-file match was wrong: stop using it
                 index.tail_enabled = False
@@ -673,6 +698,7 @@ async def save_image(page, ctx, src, out_dir, index, lock, ui=None):
         if name is None and fp:
             name = index.find_pixel(fp[0]) or index.find_near(fp[1], fp[2], fp[3], ext, len(body))
         if name:
+            index.claim(name, key)
             index.alias(key, name)
             return "skipped", "content"
         path = out_dir / f"gemini_{key}.{ext}"
@@ -705,7 +731,7 @@ async def nudge_bottom(page):
         pass
 
 
-async def collect_images(ui, page, expected=0, best=None, passes=3, careful=False):
+async def collect_images(ui, page, expected=0, best=None, passes=3, careful=False, jump=False):
     """Scroll the whole Library (up to `passes` passes, stopping when a pass finds nothing new)
     and return one web address per distinct image. `best` accumulates what has been seen.
     careful=True always waits the full time after each scroll (slower, used when retrying)."""
@@ -724,14 +750,14 @@ async def collect_images(ui, page, expected=0, best=None, passes=3, careful=Fals
         for im in await page.evaluate(COLLECT_JS):
             sighting(im)
 
-    async def one_pass(label, wait_ms, idle_limit):
+    async def one_pass(label, wait_ms, idle_limit, jump=False):
         idle = 0
         await grab()
         last = len(keys)
         for step in range(6000):
             ui.check()
-            moved = await scroll_everything_down(page, rescan=(step % 25 == 0 or idle > 0))
-            if idle or careful:
+            moved = await scroll_everything_down(page, rescan=(step % 25 == 0 or idle > 0 or jump), jump=jump)
+            if idle or careful or jump:
                 await page.wait_for_timeout(wait_ms)        # stalled or careful: give the page its full time
             else:
                 await settle(page, 250, wait_ms)            # moving: carry on as soon as images are in
@@ -749,14 +775,15 @@ async def collect_images(ui, page, expected=0, best=None, passes=3, careful=Fals
         return len(keys)
 
     previous = -1
-    for pass_no in range(1, passes + 1):
+    for pass_no in range(1, (1 if jump else passes) + 1):
         if pass_no > 1:
             ui.log(f"Checking for any missed images (pass {pass_no})...")
             await scroll_to_top(page)
             await page.wait_for_timeout(1500)
         t_pass = time.monotonic()
-        total = await one_pass(f"pass {pass_no}", 1100 if pass_no == 1 else 800, 6)
-        ui.log(f"  pass {pass_no}: {total} images ({fmt_dur(time.monotonic() - t_pass)})")
+        label = "quick listing" if jump else f"pass {pass_no}"
+        total = await one_pass(label, 1000 if jump else (1100 if pass_no == 1 else 800), 6, jump=jump)
+        ui.log(f"  {label}: {total} images ({fmt_dur(time.monotonic() - t_pass)})")
         if total == previous:
             break
         if expected and total == expected:
@@ -822,7 +849,25 @@ async def session(ui, ctx, out_dir, index):
         fast_tried = blocker is not None
         if fast_tried:
             ui.log("Scanning the Library using small previews (faster)...")
-    candidates = await collect_images(ui, page, expected, best)
+    candidates = None
+    if QUICK_LISTING and expected and index.jump_failures < 2:
+        ui.log("Trying a quicker way to list the Library (jumping to the bottom to load it all)...")
+        candidates = await collect_images(ui, page, expected, best, jump=True)
+        if count_distinct(best) >= 0.99 * expected:
+            index.jump_failures = 0
+        else:
+            index.jump_failures += 1
+            index.jump_failed_version = VERSION
+            ui.log(f"  The quick listing found only {count_distinct(best)} of about {expected}, "
+                   "so listing the Library the careful way...")
+            candidates = None
+            await scroll_to_top(page)
+            await page.wait_for_timeout(1500)
+        index.dirty = True
+    elif QUICK_LISTING and expected:
+        ui.log("Listing the Library the careful way (the quick way didn't work on the last runs).")
+    if candidates is None:
+        candidates = await collect_images(ui, page, expected, best)
     counts = [count_distinct(best)]
     for attempt in (1, 2):
         if not expected or counts[-1] >= 0.95 * expected:
@@ -880,6 +925,11 @@ async def session(ui, ctx, out_dir, index):
 
     # ---- Save ----
     total = len(candidates)
+    try:
+        ui.log(f"The page holds {await page.evaluate('document.images.length')} picture elements "
+               f"for {total} Library pictures.")
+    except Exception:
+        pass
     t_save = time.monotonic()
 
     ui.log(f"Found {total} images in your Library. Saving new ones to: {out_dir}")
@@ -1002,6 +1052,10 @@ async def run(ui, out_dir):
                                 for k in ("png", "jpg", "webp") if COUNTS["tried_" + k])
             if by_type:
                 ui.log(f"   File-end matches by picture type: {by_type}")
+        if COUNTS["tail_shared"]:
+            ui.log(f"   {COUNTS['tail_shared']} Library entries matched a file that another entry had already "
+                   f"matched; each was checked in full: {COUNTS['tail_shared_same']} were the identical picture, "
+                   f"{COUNTS['tail_shared'] - COUNTS['tail_shared_same']} were different")
         ui.status(f"Done in {fmt_dur(took)}.")
         try:
             os.startfile(out_dir)    # open the folder (Windows)
