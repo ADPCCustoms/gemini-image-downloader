@@ -19,6 +19,7 @@ Download all the images in your Gemini <b>Library</b> to your PC in one go, with
 - Runs **100% locally**: you sign in to your own Google account in a normal browser window, and nothing is uploaded anywhere
 - Uses your installed **Google Chrome or Microsoft Edge**, no extra browser download
 - **Safe to re-run**: recognises pictures you already have (even ones saved by older versions, under other names, or with different file metadata) and only saves new ones
+- **New pictures only** mode: after one full scan, later runs check just the newest part of your Library and finish in a few minutes
 - Time-stamped progress log, a running timer, an estimate of time left and a time-taken summary when it finishes
 - A clean, modern window with **light and dark modes** (follows Windows by default, or pick Light/Dark), a progress bar, a Stop button and a choice of save folder
 - Friendly messages if something goes wrong
@@ -53,6 +54,23 @@ Run it again any time to pick up new images. To sign out, delete the `browser_pr
 next to the program.
 
 **Requirements:** Windows 10/11 and Google Chrome or Microsoft Edge (Edge comes with Windows).
+
+## Scan modes
+
+- **New pictures only (faster)** is ticked by default. Gemini lists new pictures first, so the tool looks at the
+  newest part of your Library and stops once it reaches pictures you already have. It usually takes a few
+  minutes instead of about 15.
+  - The first runs are full scans. The first full scan records the order of your Library; the next full scan that
+    finds new pictures confirms they appear at the top. After that, new-pictures-only runs are used.
+  - A **full scan is still done at least every 7 days**, and automatically if the order of your Library no longer
+    matches what the tool recorded. Untick the box any time for a complete scan.
+  - If new pictures ever turn out *not* to be listed first, the tool switches the mode off and says so.
+- **Quick listing (experimental)** is unticked by default and only affects full scans. It jumps straight to the
+  bottom of the Library to load everything at once. In testing it was no faster than the normal scan and
+  sometimes stopped short, so a few pictures could be missed. Hover over the **?** next to each option in the
+  window to see this note.
+
+From the command line: `--full` turns new-pictures-only off, and `--quick-listing` turns the quick listing on.
 
 ## Privacy
 

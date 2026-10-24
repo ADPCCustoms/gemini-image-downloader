@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.3.3"
+VERSION = "1.4.0"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -45,7 +45,20 @@ GEMINI_URL = "https://gemini.google.com/app"
 BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DEFAULT_OUT = BASE / "gemini_images"
 PROFILES = BASE / "browser_profile"      # keeps you logged in between runs
-QUICK_LISTING = "--no-quick-listing" not in sys.argv   # try jumping straight to the bottom of the Library first
+TOP_WINDOW = 500         # new-pictures-only mode: how many of the newest pictures to look at first
+TOP_KNOWN_TAIL = 100     # ...and it stops when this many at the end of that window are already saved
+FULL_CHECK_DAYS = 7      # a full scan is done at least this often, even in new-pictures-only mode
+
+
+class Options:
+    """What the person asked for in this run (the window's tick boxes / command-line switches)."""
+    def __init__(self, new_only=True, quick=False, full_days=FULL_CHECK_DAYS):
+        self.new_only = new_only       # only look at the newest part of the Library (when it is safe to)
+        self.quick = quick             # experimental: jump to the bottom of the Library to list it
+        self.full_days = full_days
+
+
+OPTS = Options(new_only="--full" not in sys.argv, quick="--quick-listing" in sys.argv)
 PREVIEW_SCAN = "--preview-scan" in sys.argv   # ask for small previews while scanning (measured: no real speed-up)
 
 BROWSERS = [("chrome", "Google Chrome"), ("msedge", "Microsoft Edge")]
@@ -338,6 +351,21 @@ TAIL_BYTES = 32768       # how much of the END of a file identifies a picture (s
 TAIL_VERIFY_EVERY = 50   # spot-check every 50th end-of-file match against the full picture
 
 
+ORDER_JS = """() => [...document.querySelectorAll('img')].map(e => e.currentSrc || e.src)"""
+
+
+async def dom_positions(page):
+    """Where each picture sits in the page (its place in the Library list), by image key."""
+    try:
+        srcs = await page.evaluate(ORDER_JS)
+    except Exception:
+        return {}
+    pos = {}
+    for i, src in enumerate(srcs):
+        pos.setdefault(image_key(src)[0], i)
+    return pos
+
+
 def image_key(src):
     """Stable name for an image so re-runs can skip ones already saved."""
     full = re.sub(r"=[sw]\d+.*$", "=s0", src)
@@ -419,6 +447,8 @@ class ImageIndex:
         self.fast_failures = 0   # runs in a row where the fast (preview-size) scan came up short
         self.fast_failed_version = ""   # tool version those failures happened with
         self.tails = defaultdict(list)  # fingerprint of a file's end -> [file names]
+        self.newest_first = None        # True/False once a full scan has shown where new pictures appear
+        self.last_full_scan = 0.0       # when the whole Library was last listed
         self.jump_failures = 0          # runs in a row where the quick listing came up short
         self.jump_failed_version = ""
         self.claims = {}                # file name -> the Library entry that matched it first (this run)
@@ -447,6 +477,8 @@ class ImageIndex:
             self.fast_failed_version = str(data.get("fast_failed_version", ""))
             if self.fast_failed_version != VERSION:
                 self.fast_failures = 0          # a new version of the tool gets to try the fast scan again
+            self.newest_first = data.get("newest_first")
+            self.last_full_scan = float(data.get("last_full_scan", 0.0))
             self.jump_failures = int(data.get("jump_failures", 0))
             self.jump_failed_version = str(data.get("jump_failed_version", ""))
             if self.jump_failed_version != VERSION:
@@ -541,6 +573,57 @@ class ImageIndex:
                 return name
         return None
 
+    def has_ranks(self):
+        """Has a full scan recorded where each saved picture sits in the Library list?"""
+        have = sum(1 for r in self.files.values() if r.get("rank") is not None)
+        return bool(self.files) and have >= 0.5 * len(self.files)
+
+    def set_ranks_full(self, order_names):
+        ranks = {}
+        for pos, name in enumerate(order_names):
+            ranks.setdefault(name, pos)
+        for name, rec in self.files.items():
+            if name in ranks:
+                rec["rank"] = ranks[name]
+            else:
+                rec.pop("rank", None)          # no longer in the Library
+        self.dirty = True
+
+    def assign_new_ranks(self, new_names):
+        """New pictures sit above everything already saved, in the order they were listed."""
+        existing = [r["rank"] for r in self.files.values() if r.get("rank") is not None]
+        base = (min(existing) if existing else 0) - len(new_names)
+        for j, name in enumerate(new_names):
+            if name in self.files:
+                self.files[name]["rank"] = base + j
+        if new_names:
+            self.dirty = True
+
+    def rank_consistency(self, names):
+        """Do these saved pictures, listed in this order now, appear in the same order as in the last
+        full scan? Returns the share of neighbouring pairs in order, or None if there are too few."""
+        ranks = [self.files[n].get("rank") for n in names if n in self.files]
+        ranks = [r for r in ranks if r is not None]
+        if len(ranks) < 20:
+            return None
+        return sum(1 for a, b in zip(ranks, ranks[1:]) if b >= a) / (len(ranks) - 1)
+
+    def new_only_blocker(self, days):
+        """None if a new-pictures-only scan is safe; otherwise why a full scan is needed first."""
+        if self.newest_first is False:
+            return "Gemini doesn't list new pictures at the top of the Library, so new-pictures-only mode can't be used."
+        if not self.has_ranks():
+            return "the order of your Library hasn't been recorded yet (that happens during a full scan)."
+        if self.newest_first is None:
+            return ("the tool hasn't yet confirmed that Gemini lists new pictures at the top. "
+                    "This full scan will confirm it if you have made new pictures since the last one.")
+        age = (time.time() - self.last_full_scan) if self.last_full_scan else None
+        if age is None or age > days * 86400:
+            when = ("a full scan has never been completed" if age is None
+                    else f"it's been {int(age // 86400)} days since the last full scan")
+            return f"{when} (one is done at least every {days} days)."
+        return None
+
     def claim(self, name, key):
         """Note that Library entry `key` matched file `name`. Returns the entry that matched it first,
         if that was a different one (two Library entries for what looks like the same picture)."""
@@ -573,6 +656,8 @@ class ImageIndex:
                                                  "fast_failures": self.fast_failures,
                                                  "fast_failed_version": self.fast_failed_version,
                                                  "tail_off_version": self.tail_off_version,
+                                                 "newest_first": self.newest_first,
+                                                 "last_full_scan": self.last_full_scan,
                                                  "jump_failures": self.jump_failures,
                                                  "jump_failed_version": self.jump_failed_version}), encoding="utf-8")
             self.dirty = False
@@ -641,13 +726,13 @@ async def fetch_tail(ctx, full):
 
 
 async def save_image(page, ctx, src, out_dir, index, lock, ui=None):
-    """Returns ('skipped', 'address' | 'tail' | 'content') or ('saved', 'new')."""
+    """Returns ('skipped', 'address' | 'tail' | 'content', file name) or ('saved', 'new', file name)."""
     key, full = image_key(src)
     if index.has_url(key):
         name = index.hashes.get(index.urls[key])
         if name:
             index.claim(name, key)
-        return "skipped", "address"           # quick check by web address
+        return "skipped", "address", name     # quick check by web address
 
     body = ctype = None
     if index.tail_enabled and index.tail_ready and Image is not None \
@@ -669,7 +754,7 @@ async def save_image(page, ctx, src, out_dir, index, lock, ui=None):
                 if not shared and int(key, 16) % TAIL_VERIFY_EVERY:
                     index.alias(key, name)
                     COUNTS["tail_hits"] += 1
-                    return "skipped", "tail"
+                    return "skipped", "tail", name
                 # check in full: spot checks, and every picture that shares a file with another entry
                 body, ctype = await fetch_image(page, ctx, src, full)
                 fp = await asyncio.get_running_loop().run_in_executor(None, pixel_fingerprint, body)
@@ -678,7 +763,7 @@ async def save_image(page, ctx, src, out_dir, index, lock, ui=None):
                     COUNTS["tail_verified"] += 1
                     if shared:
                         COUNTS["tail_shared_same"] += 1
-                    return "skipped", "tail"
+                    return "skipped", "tail", name
                 COUNTS["tail_mismatch"] += 1          # an end-of-file match was wrong: stop using it
                 index.tail_enabled = False
                 index.tail_off_version = VERSION
@@ -701,11 +786,11 @@ async def save_image(page, ctx, src, out_dir, index, lock, ui=None):
         if name:
             index.claim(name, key)
             index.alias(key, name)
-            return "skipped", "content"
+            return "skipped", "content", name
         path = out_dir / f"gemini_{key}.{ext}"
         path.write_bytes(body)
         index.add(key, h, path, fp, body)
-        return "saved", "new"
+        return "saved", "new", path.name
 
 
 async def scroll_to_top(page):
@@ -732,7 +817,7 @@ async def nudge_bottom(page):
         pass
 
 
-async def collect_images(ui, page, expected=0, best=None, passes=3, careful=False, jump=False):
+async def collect_images(ui, page, expected=0, best=None, passes=3, careful=False, jump=False, target=None):
     """Scroll the whole Library (up to `passes` passes, stopping when a pass finds nothing new)
     and return one web address per distinct image. `best` accumulates what has been seen.
     careful=True always waits the full time after each scroll (slower, used when retrying)."""
@@ -769,6 +854,8 @@ async def collect_images(ui, page, expected=0, best=None, passes=3, careful=Fals
             last = now
             if idle >= idle_limit:
                 break
+            if target and now >= target:
+                break                       # enough of the top of the Library for new-pictures-only mode
             if stalled and idle in (2, 4):
                 await nudge_bottom(page)
             if step % 5 == 0:
@@ -799,7 +886,9 @@ async def collect_images(ui, page, expected=0, best=None, passes=3, careful=Fals
         size = im["w"] * im["h"]
         if k not in by_key or size > by_key[k][1]:
             by_key[k] = (src, size)
-    return [v[0] for v in by_key.values()]
+    pos = await dom_positions(page)         # return them in the order the Library lists them
+    ordered = sorted(by_key.items(), key=lambda kv: pos.get(kv[0], 10 ** 9))
+    return [v[0] for k, v in ordered]
 
 
 async def session(ui, ctx, out_dir, index):
@@ -839,9 +928,8 @@ async def session(ui, ctx, out_dir, index):
 
     # ---- Scroll to load everything ----
     t_scan, w_scan = time.monotonic(), TIMING["Waiting for you"]
-    ui.log("Loading your images (this can take a few minutes if you have a lot)...")
-    ui.progress(None, None)
     expected = index.expected_library_size()
+    s_scan0 = TIMING["Saving images"]
     best = {}
     blocker = None
     fast_tried = False
@@ -865,100 +953,15 @@ async def session(ui, ctx, out_dir, index):
                           "browser window, then continue.")
         await page.wait_for_timeout(6000)
 
-    candidates = None
-    use_quick = QUICK_LISTING and expected and index.jump_failures < 2
-    quick_ok = False
-    if use_quick:
-        ui.log("Trying a quicker way to list the Library (jumping to the bottom to load it all)...")
-        candidates = await collect_images(ui, page, expected, best, jump=True)
-        quick_ok = count_distinct(best) >= 0.99 * expected
-        if not quick_ok:
-            # Gemini often loads only the first ~600 pictures the first time; a reload fixes that
-            ui.log(f"  The quick listing found only {count_distinct(best)} of about {expected}. Gemini may not "
-                   "have finished loading, so reloading the Library and trying again...")
-            await reload_library()
-            candidates = await collect_images(ui, page, expected, best, jump=True)
-            quick_ok = count_distinct(best) >= 0.99 * expected
-            if not quick_ok:
-                ui.log(f"  The quick listing found {count_distinct(best)} of about {expected}, "
-                       "so listing the Library the careful way...")
-                candidates = None
-                await scroll_to_top(page)
-                await page.wait_for_timeout(1500)
-        if quick_ok:
-            index.jump_failures = 0
-            index.dirty = True
-    elif QUICK_LISTING and expected:
-        ui.log("Listing the Library the careful way (the quick way didn't work on the last runs).")
-    if candidates is None:
-        candidates = await collect_images(ui, page, expected, best)
-    counts = [count_distinct(best)]
-    if use_quick and not quick_ok and counts[0] >= 0.95 * expected:
-        # the page was healthy (the careful way found everything) but the quick way still failed
-        index.jump_failures += 1
-        index.jump_failed_version = VERSION
-        index.dirty = True
-    for attempt in (1, 2):
-        if not expected or counts[-1] >= 0.95 * expected:
-            break
-        if len(counts) > 1 and counts[-1] == counts[-2]:
-            break                                  # the last reload found nothing new
-        ui.log(f"Found {counts[-1]} images but expected about {expected}. Gemini may not have "
-               f"finished loading, so reloading the Library to look again carefully ({attempt} of 2)...")
-        await reload_library()
-        candidates = await collect_images(ui, page, expected, best, passes=1, careful=True)
-        counts.append(count_distinct(best))
-
-    if blocker:
-        await unblock_library_images(page, blocker)
-    TIMING["Scanning your Library"] += (time.monotonic() - t_scan) - (TIMING["Waiting for you"] - w_scan)
-    if fast_tried:
-        if counts[0] >= 0.95 * expected:
-            index.fast_failures = 0
-        else:
-            index.fast_failures += 1
-            index.fast_failed_version = VERSION
-        index.dirty = True
-    found = counts[-1]
-    if expected and found < 0.95 * expected:
-        ui.log(f"Only {found} images found (expected about {expected}). If you haven't deleted images "
-               "from Gemini, keep the browser window visible and click Start again.")
-        if index.last_short == found:
-            ui.log(f"That's the same count as the last short run, so {found} will be treated as the "
-                   "size of your Library from now on.")
-            index.library_total, index.last_short = found, 0
-        else:
-            index.last_short = found
-        index.dirty = True
-    elif candidates:
-        index.library_total, index.last_short = len(candidates), 0
-        index.dirty = True
-
-    if not candidates:
-        shot = BASE / "no_images_found.png"
-        try:
-            await page.screenshot(path=str(shot))
-        except Exception:
-            pass
-        ui.alert("No images were found on this page.\n\nEither your Library is empty, or Gemini's "
-                 f"layout has changed since this tool was made.\nA screenshot was saved to:\n{shot}")
-        return None
-
-    # ---- Save ----
-    total = len(candidates)
-    try:
-        ui.log(f"The page holds {await page.evaluate('document.images.length')} picture elements "
-               f"for {total} Library pictures.")
-    except Exception:
-        pass
-    t_save = time.monotonic()
-
-    ui.log(f"Found {total} images in your Library. Saving new ones to: {out_dir}")
-    stats = Counter()
-    per_shape = defaultdict(Counter)
+    # ---- checking pictures against what is already in the folder ----
     global FULL_LIMIT
     FULL_LIMIT = asyncio.Semaphore(CONCURRENCY)
     lock, sem = asyncio.Lock(), asyncio.Semaphore(LOOKUP_CONCURRENCY)
+    stats, per_shape = Counter(), defaultdict(Counter)
+    results = {}          # picture key -> (status, how, file name), for every Library entry checked so far
+
+    def key_of(src):
+        return image_key(src)[0]
 
     async def work(src):
         async with sem:
@@ -970,47 +973,214 @@ async def session(ui, ctx, out_dir, index):
             except Exception as e:
                 return src, None, e
 
-    tasks = [asyncio.ensure_future(work(s)) for s in candidates]
-    try:
-        for n, fut in enumerate(asyncio.as_completed(tasks), 1):
-            src, result, err = await fut
-            shape = url_shape(src)
-            if err is not None:
-                stats["failed"] += 1
-                per_shape[shape]["failed"] += 1
-                if DEBUG or stats["failed"] <= 3:
-                    ui.log(f"  could not save one image: {err}")
-            else:
-                status, how = result
-                stats[how] += 1
-                per_shape[shape][how] += 1
-                if status == "saved" and stats["new"] % 50 == 0:
-                    index.save()
-            ui.progress(n, total)
-            eta = ""
-            if 50 <= n < total:
-                eta = f" (about {fmt_dur((time.monotonic() - t_save) / n * (total - n))} left)"
-            ui.status(f"Saving images... {n}/{total}{eta}")
-            if n % 50 == 0 or n == total:
-                ui.log(f"  {n}/{total} done ({stats['new']} new, "
-                       f"{stats['address'] + stats['tail'] + stats['content']} already in folder, {stats['failed']} failed)")
-    except BaseException:
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+    async def process(cands, total_hint, done_before):
+        if not cands:
+            return
+        t0 = time.monotonic()
+        tasks = [asyncio.ensure_future(work(c)) for c in cands]
+        try:
+            for n, fut in enumerate(asyncio.as_completed(tasks), 1):
+                src, result, err = await fut
+                shape = url_shape(src)
+                if err is not None:
+                    stats["failed"] += 1
+                    per_shape[shape]["failed"] += 1
+                    if DEBUG or stats["failed"] <= 3:
+                        ui.log(f"  could not save one image: {err}")
+                else:
+                    status, how, name = result
+                    results[key_of(src)] = (status, how, name)
+                    stats[how] += 1
+                    per_shape[shape][how] += 1
+                    if status == "saved" and stats["new"] % 50 == 0:
+                        index.save()
+                done = done_before + n
+                ui.progress(done, total_hint)
+                eta = ""
+                if 50 <= n < len(cands):
+                    eta = f" (about {fmt_dur((time.monotonic() - t0) / n * (len(cands) - n))} left)"
+                ui.status(f"Saving images... {done}/{total_hint}{eta}")
+                if done % 50 == 0 or n == len(cands):
+                    ui.log(f"  {done}/{total_hint} done ({stats['new']} new, "
+                           f"{stats['address'] + stats['tail'] + stats['content']} already in folder, "
+                           f"{stats['failed']} failed)")
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            TIMING["Saving images"] += time.monotonic() - t0
 
-    TIMING["Saving images"] += time.monotonic() - t_save
+    # ---- which kind of scan? ----
+    mode = "full"
+    if OPTS.new_only:
+        why = index.new_only_blocker(OPTS.full_days) if expected else "there is no earlier scan to compare with."
+        if why is None:
+            mode = "new"
+        else:
+            ui.log(f"Doing a full scan: {why}")
+    candidates = []
+
+    # ---- new pictures only: look at the top of the Library, stop when we reach pictures we already have ----
+    if mode == "new":
+        ui.log(f"New pictures only: checking the newest part of your Library (the first {TOP_WINDOW}, "
+               "and further down if new pictures run close to the end of that)...")
+        target, reloads = TOP_WINDOW, 0
+        while True:
+            ui.check()
+            candidates = await collect_images(ui, page, expected, best, passes=1, target=target)
+            wanted = min(target, expected)
+            if len(candidates) < 0.95 * wanted and reloads < 2:
+                reloads += 1
+                ui.log(f"Found {len(candidates)} pictures but expected at least {wanted}. Gemini may not have "
+                       f"finished loading, so reloading the Library to look again ({reloads} of 2)...")
+                await reload_library()
+                continue
+            await process([c for c in candidates if key_of(c) not in results], len(candidates), len(results))
+            tail_keys = [key_of(c) for c in candidates[-TOP_KNOWN_TAIL:]]
+            tail_has_new = any(results.get(k, ("",))[0] == "saved" for k in tail_keys)
+            if len(candidates) < target or not tail_has_new:
+                break
+            target += TOP_WINDOW
+            ui.log("New pictures run close to the end of that part of the Library, so looking further down...")
+        known = [results[k][2] for k in map(key_of, candidates)
+                 if k in results and results[k][0] == "skipped" and results[k][2]]
+        agreement = index.rank_consistency(known)
+        if agreement is not None and agreement < 0.95:
+            ui.log(f"The Library's order no longer matches the last full scan ({agreement:.0%} of neighbouring "
+                   "pictures in order), so doing a full scan now...")
+            mode = "full"
+            await scroll_to_top(page)
+            await page.wait_for_timeout(1500)
+        else:
+            added = [results[k][2] for k in map(key_of, candidates) if k in results and results[k][0] == "saved"]
+            index.assign_new_ranks(added)
+            index.library_total += len(added)
+            index.dirty = True
+
+    # ---- full scan: list the whole Library ----
+    complete = True
+    if mode == "full":
+        ui.log("Loading your images (this can take a few minutes if you have a lot)...")
+        ui.progress(None, None)
+        candidates = None
+        use_quick = OPTS.quick and expected and index.jump_failures < 2
+        quick_ok = False
+        if use_quick:
+            ui.log("Trying a quicker way to list the Library (jumping to the bottom to load it all)...")
+            candidates = await collect_images(ui, page, expected, best, jump=True)
+            quick_ok = count_distinct(best) >= 0.99 * expected
+            if not quick_ok:
+                # Gemini often loads only the first ~600 pictures the first time; a reload fixes that
+                ui.log(f"  The quick listing found only {count_distinct(best)} of about {expected}. Gemini may not "
+                       "have finished loading, so reloading the Library and trying again...")
+                await reload_library()
+                candidates = await collect_images(ui, page, expected, best, jump=True)
+                quick_ok = count_distinct(best) >= 0.99 * expected
+                if not quick_ok:
+                    ui.log(f"  The quick listing found {count_distinct(best)} of about {expected}, "
+                           "so listing the Library the careful way...")
+                    candidates = None
+                    await scroll_to_top(page)
+                    await page.wait_for_timeout(1500)
+            if quick_ok:
+                index.jump_failures = 0
+                index.dirty = True
+        elif OPTS.quick and expected:
+            ui.log("Listing the Library the careful way (the quick way didn't work on the last runs).")
+        if candidates is None:
+            candidates = await collect_images(ui, page, expected, best)
+        counts = [count_distinct(best)]
+        if use_quick and not quick_ok and counts[0] >= 0.95 * expected:
+            # the page was healthy (the careful way found everything) but the quick way still failed
+            index.jump_failures += 1
+            index.jump_failed_version = VERSION
+            index.dirty = True
+        for attempt in (1, 2):
+            if not expected or counts[-1] >= 0.95 * expected:
+                break
+            if len(counts) > 1 and counts[-1] == counts[-2]:
+                break                                  # the last reload found nothing new
+            ui.log(f"Found {counts[-1]} images but expected about {expected}. Gemini may not have "
+                   f"finished loading, so reloading the Library to look again carefully ({attempt} of 2)...")
+            await reload_library()
+            candidates = await collect_images(ui, page, expected, best, passes=1, careful=True)
+            counts.append(count_distinct(best))
+
+        if blocker:
+            await unblock_library_images(page, blocker)
+        if fast_tried:
+            if counts[0] >= 0.95 * expected:
+                index.fast_failures = 0
+            else:
+                index.fast_failures += 1
+                index.fast_failed_version = VERSION
+            index.dirty = True
+        found = counts[-1]
+        complete = not (expected and found < 0.95 * expected)
+        if not complete:
+            ui.log(f"Only {found} images found (expected about {expected}). If you haven't deleted images "
+                   "from Gemini, keep the browser window visible and click Start again.")
+            if index.last_short == found:
+                ui.log(f"That's the same count as the last short run, so {found} will be treated as the "
+                       "size of your Library from now on.")
+                index.library_total, index.last_short = found, 0
+            else:
+                index.last_short = found
+            index.dirty = True
+        elif candidates:
+            index.library_total, index.last_short = len(candidates), 0
+            index.dirty = True
+
+        if not candidates:
+            shot = BASE / "no_images_found.png"
+            try:
+                await page.screenshot(path=str(shot))
+            except Exception:
+                pass
+            ui.alert("No images were found on this page.\n\nEither your Library is empty, or Gemini's "
+                     f"layout has changed since this tool was made.\nA screenshot was saved to:\n{shot}")
+            return None
+
+        try:
+            ui.log(f"The page holds {await page.evaluate('document.images.length')} picture elements "
+                   f"for {len(candidates)} Library pictures.")
+        except Exception:
+            pass
+        ui.log(f"Found {len(candidates)} images in your Library. Saving new ones to: {out_dir}")
+        await process([c for c in candidates if key_of(c) not in results], len(candidates), len(results))
+
+        if complete and stats["failed"] == 0:
+            # remember where each picture sits in the list, and check where new pictures appear
+            keys = [key_of(c) for c in candidates]
+            index.set_ranks_full([results[k][2] for k in keys if k in results and results[k][2]])
+            new_positions = [i for i, k in enumerate(keys) if results.get(k, ("",))[0] == "saved"]
+            if new_positions and len(new_positions) <= 0.2 * len(candidates):
+                at_top = all(p < max(30, 2 * len(new_positions)) for p in new_positions)
+                index.newest_first = at_top
+                ui.log("Library order check: " + (
+                    f"the {len(new_positions)} new pictures were at the top of the list, so new-pictures-only "
+                    "mode can be used from now on." if at_top else
+                    f"{len(new_positions)} new pictures were NOT all at the top of the list, so "
+                    "new-pictures-only mode can't be used."))
+            index.last_full_scan = time.time()
+            index.dirty = True
+
+    TIMING["Scanning your Library"] += ((time.monotonic() - t_scan) - (TIMING["Waiting for you"] - w_scan)
+                                        - (TIMING["Saving images"] - s_scan0))
     ui.log("Image address types (private parts hidden):")
     for shape, c in sorted(per_shape.items(), key=lambda kv: -sum(kv[1].values()))[:6]:
         ui.log(f"  {sum(c.values())} x {shape}: {c['address']} matched by address, {c['tail']} by file end, "
                f"{c['content']} by picture, {c['new']} new")
     return {"saved": stats["new"], "skipped": stats["address"] + stats["tail"] + stats["content"],
             "by_address": stats["address"], "by_tail": stats["tail"], "by_content": stats["content"],
-            "failed": stats["failed"], "total": total}
+            "failed": stats["failed"], "total": len(candidates), "mode": mode}
 
 
-async def run(ui, out_dir):
+async def run(ui, out_dir, opts=None):
+    if opts is not None:
+        OPTS.new_only, OPTS.quick, OPTS.full_days = opts.new_only, opts.quick, opts.full_days
     t_run = time.monotonic()
     TIMING.clear()
     COUNTS.clear()
@@ -1045,7 +1215,10 @@ async def run(ui, out_dir):
     if result:
         ui.log("")
         ui.log("All done!")
-        ui.log(f"  Images in your Library:       {result['total']}")
+        if result["mode"] == "new":
+            ui.log(f"  Checked the newest {result['total']} pictures of your Library (new pictures only).")
+        else:
+            ui.log(f"  Images in your Library:       {result['total']}")
         ui.log(f"  New images saved:             {result['saved']}")
         ui.log(f"  Already in your folder:       {result['skipped']}  "
                f"({result['by_address']} by address, {result['by_tail']} by file end, "
@@ -1167,6 +1340,73 @@ def save_settings(data):
         pass
 
 
+NEW_ONLY_TEXT = "New pictures only (faster)"
+NEW_ONLY_TIP = ("Checks only the newest part of your Library and stops once it reaches pictures you already have. "
+                "Usually a few minutes instead of about 15.\n\n"
+                "It relies on Gemini listing new pictures first. The tool confirms this itself during a full scan, "
+                f"and does a full scan at least every {FULL_CHECK_DAYS} days. Untick this for a complete scan now.")
+QUICK_TEXT = "Quick listing (experimental)"
+QUICK_TIP = ("Experimental, and only used for full scans. Jumps straight to the bottom of the Library to load it "
+             "all at once.\n\n"
+             "Disclaimer: in testing it was no faster than the normal scan and sometimes stopped short, so a few "
+             "pictures could be missed. Leave it off unless you want to experiment.")
+
+
+class Tooltip:
+    """A small hover note for a widget (the window toolkit has none built in)."""
+
+    def __init__(self, widget, text, delay=350):
+        self.widget, self.text, self.delay = widget, text, delay
+        self.tip, self.job = None, None
+        try:
+            widget.bind("<Enter>", self.schedule, add="+")
+            widget.bind("<Leave>", self.hide, add="+")
+            widget.bind("<ButtonPress>", self.hide, add="+")
+        except Exception:
+            pass
+
+    def schedule(self, event=None):
+        self.cancel()
+        try:
+            self.job = self.widget.after(self.delay, self.show)
+        except Exception:
+            self.job = None
+
+    def cancel(self):
+        if self.job is not None:
+            try:
+                self.widget.after_cancel(self.job)
+            except Exception:
+                pass
+            self.job = None
+
+    def show(self):
+        self.job = None
+        if self.tip is not None:
+            return
+        try:
+            import tkinter as tk
+            x = self.widget.winfo_rootx() + 24
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+            tip = self.tip = tk.Toplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_attributes("-topmost", True)
+            tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(tip, text=self.text, justify="left", wraplength=340, bg="#1F2937", fg="#F9FAFB",
+                     padx=12, pady=9, font=("Segoe UI", 10), relief="flat").pack()
+        except Exception:
+            self.tip = None
+
+    def hide(self, event=None):
+        self.cancel()
+        if self.tip is not None:
+            try:
+                self.tip.destroy()
+            except Exception:
+                pass
+            self.tip = None
+
+
 class App:
     def __init__(self, ctk):
         self.ctk = ctk
@@ -1226,8 +1466,28 @@ class App:
                       fg_color="transparent", border_width=1, border_color=BORDER, text_color=TEXT,
                       hover_color=SUBTLE_HOVER, font=font(13)).grid(row=1, column=1, padx=(0, 18), pady=(0, 12))
 
+        self.new_only_var = ctk.BooleanVar(value=bool(self.settings.get("new_only", True)))
+        self.quick_var = ctk.BooleanVar(value=bool(self.settings.get("quick", False)))
+        opts = ctk.CTkFrame(card, fg_color="transparent")
+        opts.grid(row=2, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 6))
+        self.option_boxes = []
+        for text, var, tip in ((NEW_ONLY_TEXT, self.new_only_var, NEW_ONLY_TIP),
+                               (QUICK_TEXT, self.quick_var, QUICK_TIP)):
+            line = ctk.CTkFrame(opts, fg_color="transparent")
+            line.pack(anchor="w", pady=2)
+            box = ctk.CTkCheckBox(line, text=text, variable=var, command=self.on_options, font=font(13),
+                                  checkbox_width=20, checkbox_height=20, corner_radius=5,
+                                  fg_color=ACCENT, hover_color=ACCENT_HOVER)
+            box.pack(side="left")
+            hint = ctk.CTkLabel(line, text="?", width=18, height=18, corner_radius=9, fg_color=BORDER,
+                                text_color=TEXT, font=font(11, "bold"))
+            hint.pack(side="left", padx=(8, 0))
+            Tooltip(box, tip)
+            Tooltip(hint, tip)
+            self.option_boxes.append(box)
+
         row = ctk.CTkFrame(card, fg_color="transparent")
-        row.grid(row=2, column=0, columnspan=2, sticky="w", padx=18, pady=(2, 16))
+        row.grid(row=3, column=0, columnspan=2, sticky="w", padx=18, pady=(2, 16))
         self.start_btn = ctk.CTkButton(row, text="Start download", width=150, height=40, corner_radius=10,
                                        command=self.start, fg_color=ACCENT, hover_color=ACCENT_HOVER,
                                        font=font(14, "bold"))
@@ -1355,6 +1615,11 @@ class App:
         self.settings["appearance"] = label
         save_settings(self.settings)
 
+    def on_options(self):
+        self.settings["new_only"] = bool(self.new_only_var.get())
+        self.settings["quick"] = bool(self.quick_var.get())
+        save_settings(self.settings)
+
     def browse(self):
         from tkinter import filedialog
         d = filedialog.askdirectory(title="Choose where to save your images", mustexist=False)
@@ -1386,7 +1651,10 @@ class App:
         self.status_var.set("Starting...")
         self.run_started, self.run_done = time.monotonic(), False
         self.elapsed_var.set("Elapsed 0:00")
-        self.thread = threading.Thread(target=self.work, args=(out,), daemon=True)
+        opts = Options(new_only=bool(self.new_only_var.get()), quick=bool(self.quick_var.get()))
+        for box in self.option_boxes:
+            box.configure(state="disabled")
+        self.thread = threading.Thread(target=self.work, args=(out, opts), daemon=True)
         self.thread.start()
 
     def stop(self):
@@ -1419,9 +1687,9 @@ class App:
             self.root.after(200, self.close_when_done, tries - 1)
 
     # ----- worker thread -----
-    def work(self, out):
+    def work(self, out, opts):
         try:
-            asyncio.run(run(self, out))
+            asyncio.run(run(self, out, opts))
         except Cancelled:
             self.log("Stopped.")
             self.status("Stopped.")
@@ -1488,6 +1756,8 @@ class App:
         if self.run_started is not None and not self.run_done:
             self.elapsed_var.set("Took " + fmt_clock(time.monotonic() - self.run_started))
         self.run_done = True
+        for box in self.option_boxes:
+            box.configure(state="normal")
         if self.bar_indeterminate:
             self.bar.stop()
             self.bar.configure(mode="determinate")
