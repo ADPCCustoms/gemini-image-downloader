@@ -12,7 +12,7 @@ Gemini's web page layout, so it may stop working if Google changes the site.
 Options:  --cli    run in the console instead of the window
           --debug  extra diagnostic output
 """
-import asyncio, base64, contextlib, hashlib, io, json, os, queue, re, sys, threading, time, traceback
+import asyncio, base64, contextlib, hashlib, io, json, os, queue, re, subprocess, sys, threading, time, traceback
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -1611,9 +1611,33 @@ class App:
 
     # ----- button handlers (main thread) -----
     def on_theme(self, label):
-        self.ctk.set_appearance_mode(APPEARANCE.get(label, "System"))
+        """Save the chosen look and reopen the program in it. (Switching it live made the program close on
+        some PCs, so the window is simply started again with the new look.)"""
         self.settings["appearance"] = label
         save_settings(self.settings)
+        if self.thread and self.thread.is_alive():
+            self.dialog("Theme saved", "A download is running, so the new look will apply the next time you "
+                                       "open the program.")
+            return
+        self.restart()
+
+    def restart(self):
+        try:
+            env = dict(os.environ)
+            env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"      # make the new copy start fresh, not reuse this one's files
+            env.pop("_MEIPASS2", None)
+            cmd = [sys.executable] + (sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv)
+            flags = 0x00000008 | 0x00000200 if os.name == "nt" else 0      # detached, so it outlives this window
+            subprocess.Popen(cmd, env=env, cwd=str(BASE), close_fds=True, creationflags=flags)
+        except Exception as e:
+            try:
+                (BASE / "restart_error.txt").write_text(f"{type(e).__name__}: {e}\n", encoding="utf-8")
+            except Exception:
+                pass
+            self.dialog("Theme saved", "Your choice is saved. Close the program and open it again to use it.")
+            return
+        self.status_var.set("Switching theme: reopening...")
+        self.root.after(150, self.root.destroy)
 
     def on_options(self):
         self.settings["new_only"] = bool(self.new_only_var.get())
@@ -1654,6 +1678,7 @@ class App:
         opts = Options(new_only=bool(self.new_only_var.get()), quick=bool(self.quick_var.get()))
         for box in self.option_boxes:
             box.configure(state="disabled")
+        self.theme_btn.configure(state="disabled")
         self.thread = threading.Thread(target=self.work, args=(out, opts), daemon=True)
         self.thread.start()
 
@@ -1758,6 +1783,7 @@ class App:
         self.run_done = True
         for box in self.option_boxes:
             box.configure(state="normal")
+        self.theme_btn.configure(state="normal")
         if self.bar_indeterminate:
             self.bar.stop()
             self.bar.configure(mode="determinate")

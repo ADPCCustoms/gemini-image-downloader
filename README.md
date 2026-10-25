@@ -48,7 +48,7 @@ file in that folder.
 
 Every message in the log shows the time it happened, a timer at the top right counts the elapsed time, and the final summary shows how long each part took. A copy of the log is saved as `last_run_log.txt` next to the program (use the **Open log** button); it's handy to attach to a bug report.
 
-Use the **Auto / Light / Dark** switch at the top right to change the look; it remembers your choice.
+Use the **Auto / Light / Dark** switch at the top right to change the look; it remembers your choice. The program closes and reopens itself in the new look (it waits until a download has finished).
 
 Run it again any time to pick up new images. To sign out, delete the `browser_profile` folder
 next to the program.
