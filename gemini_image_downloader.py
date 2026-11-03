@@ -30,7 +30,7 @@ try:
 except Exception:      # Pillow missing: fall back to exact-file matching only
     Image = None
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 # ---------------- SETTINGS ----------------
 SECTION = "Library"      # Sidebar item that holds your generated images
@@ -1178,6 +1178,17 @@ async def session(ui, ctx, out_dir, index):
             "failed": stats["failed"], "total": len(candidates), "mode": mode}
 
 
+def next_full_scan_note(index, opts, now=None):
+    """'Next full scan is due in N days', or None when new-pictures-only mode isn't in use."""
+    if not (opts.new_only and index.newest_first is True and index.last_full_scan):
+        return None
+    left = index.last_full_scan + opts.full_days * 86400 - (time.time() if now is None else now)
+    if left <= 0:
+        return "A full scan is due, and will be done on the next run."
+    days = int(-(-left // 86400))            # round up to whole days
+    return f"Next full scan is due in {days} day{'s' if days != 1 else ''} (new-pictures-only runs until then)."
+
+
 async def run(ui, out_dir, opts=None):
     if opts is not None:
         OPTS.new_only, OPTS.quick, OPTS.full_days = opts.new_only, opts.quick, opts.full_days
@@ -1226,6 +1237,9 @@ async def run(ui, out_dir, opts=None):
         if result["failed"]:
             ui.log(f"  Failed:                       {result['failed']}  (run it again to retry these)")
         ui.log(f"Your images are in: {out_dir}")
+        note = next_full_scan_note(index, OPTS)
+        if note:
+            ui.log("  " + note)
         took = time.monotonic() - t_run
         ui.log(f"Time taken: {fmt_dur(took)}")
         for name in ("Checking existing images", "Opening Gemini", "Waiting for you",
