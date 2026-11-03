@@ -8,6 +8,10 @@
 Download all the images in your Gemini <b>Library</b> to your PC in one go, with no need to open every chat.
 </p>
 
+<p align="center">
+  <img src="assets/screenshot.png" width="680" alt="The Gemini Image Downloader window">
+</p>
+ 
 > **Unofficial tool, not affiliated with or endorsed by Google.** It works by reading the Gemini
 > web page, so it may stop working if Google changes the site. Use it only on your own account
 > and at your own risk. Automating a website may be against its terms of service; check them
